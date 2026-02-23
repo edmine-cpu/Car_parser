@@ -1,29 +1,52 @@
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
 
+import httpx
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
 
-OFFERS_URL = "https://autach.pl/offers?from=axa"
+OFFERS_URLS = [
+    "https://autach.pl/offers?from=axa&sortby=new",
+    "https://autach.pl/offers?from=rest&sortby=new",
+    "https://autach.pl/offers?from=allianz&sortby=new",
+]
+
+SPEC_MAP = {
+    "Treibstoff": "Вид палива",
+    "Hubraum": "Об'єм двигуна",
+    "Getriebe": "Коробка передач",
+    "Antrieb": "Привiд",
+    "Karosserie": "Кузов",
+    "Aussenfarbe": "Колiр",
+}
 
 
 @dataclass
 class OfferItem:
+    id: str
     title: str
+    year: str
+    mileage: str
+    auction_end: str
+    url: str
     image_url: str
-    detail_url: str
+    source: str = ""
 
 
-async def fetch_offers() -> list[OfferItem]:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.goto(OFFERS_URL)
-        await page.wait_for_selector(".offer-card h3", timeout=15000)
-        html = await page.content()
-        await browser.close()
+@dataclass
+class OfferDetail:
+    title: str
+    year: str
+    mileage: str
+    fuel: str
+    engine: str
+    transmission: str
+    photos: list[str] = field(default_factory=list)
+    specs: dict[str, str] = field(default_factory=dict)
 
+
+def _parse_cards(html: str, source: str) -> list[OfferItem]:
     soup = BeautifulSoup(html, "lxml")
-    cards = soup.select(".offer-container .offer-card")
+    cards = soup.select(".offer-card")
 
     offers: list[OfferItem] = []
     for card in cards:
@@ -32,13 +55,137 @@ async def fetch_offers() -> list[OfferItem]:
             continue
         title = h3.get_text(strip=True)
 
-        img = card.select_one(".swiper-slide img")
-        image_url = img["src"] if img and img.get("src") else ""
+        auction_id_el = card.select_one("p.auction-id")
+        lot_id = ""
+        if auction_id_el:
+            text = auction_id_el.get_text(strip=True)
+            if ":" in text:
+                lot_id = text.split(":")[1].strip().split()[0]
 
-        link = card.select_one("a.offer-link")
-        detail_url = link["href"] if link and link.get("href") else ""
+        year = ""
+        mileage = ""
+        auction_end = ""
+        labels = card.select(".offer-details p.label")
+        for label_el in labels:
+            label_text = label_el.get_text(strip=True)
+            value_el = label_el.find_next_sibling("p", class_="value")
+            if not value_el:
+                continue
+            value_text = value_el.get_text(strip=True)
 
-        if title and image_url and detail_url:
-            offers.append(OfferItem(title=title, image_url=image_url, detail_url=detail_url))
+            if "Rejestracja" in label_text:
+                year = value_text
+            elif "Przebieg" in label_text:
+                mileage = value_text.replace(" km", "").replace("\xa0", "").strip()
+            elif label_text == "Data zakończenia":
+                auction_end = value_text
+
+        link_el = card.select_one("a[href*='/offer/']")
+        detail_url = link_el["href"] if link_el else ""
+
+        img_el = card.select_one(".swiper-slide img")
+        image_url = img_el["src"] if img_el and img_el.get("src") else ""
+
+        offers.append(OfferItem(
+            id=lot_id,
+            title=title,
+            year=year,
+            mileage=mileage,
+            auction_end=auction_end,
+            url=detail_url,
+            image_url=image_url,
+            source=source,
+        ))
 
     return offers
+
+
+async def fetch_offers() -> list[OfferItem]:
+    """Fetch from all sources, merge, sort by auction_end desc (newest first)."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        tasks = [client.get(url) for url in OFFERS_URLS]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_offers: list[OfferItem] = []
+    sources = ["AXA", "REST", "Allianz"]
+    for resp, source in zip(responses, sources):
+        if isinstance(resp, Exception):
+            continue
+        resp.raise_for_status()
+        all_offers.extend(_parse_cards(resp.text, source))
+
+    # Deduplicate by offer ID
+    seen: set[str] = set()
+    unique: list[OfferItem] = []
+    for o in all_offers:
+        if o.id and o.id not in seen:
+            seen.add(o.id)
+            unique.append(o)
+
+    # Sort by auction_end descending (newest first)
+    unique.sort(key=lambda o: o.auction_end, reverse=True)
+    return unique
+
+
+async def fetch_offer_detail(url: str) -> OfferDetail | None:
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    h2 = soup.select_one("h2")
+    title = h2.get_text(strip=True) if h2 else ""
+
+    year = ""
+    mileage = ""
+    for label_el in soup.select("p.label"):
+        label_text = label_el.get_text(strip=True).lower()
+        value_el = label_el.find_next_sibling("p")
+        if not value_el:
+            continue
+        val = value_el.get_text(strip=True)
+        if "rejestracja" in label_text or "registrierung" in label_text:
+            year = val
+        elif "przebieg" in label_text:
+            mileage = val.replace(" km", "").replace("\xa0", "").strip()
+
+    specs: dict[str, str] = {}
+    fuel = ""
+    engine = ""
+    transmission = ""
+    for row in soup.select(".table-row"):
+        cols = row.select(".table-col")
+        if len(cols) < 2:
+            continue
+        key = cols[0].get_text(strip=True)
+        val = cols[1].get_text(strip=True)
+        if not val:
+            continue
+
+        if key == "Treibstoff":
+            fuel = val
+        elif key == "Hubraum":
+            engine = val
+        elif key == "Getriebe":
+            transmission = val
+
+        if key in SPEC_MAP:
+            specs[SPEC_MAP[key]] = val
+
+    photos = []
+    for img in soup.select(".image-slider img"):
+        src = img.get("src", "")
+        if src and src not in photos:
+            photos.append(src)
+
+    return OfferDetail(
+        title=title,
+        year=year,
+        mileage=mileage,
+        fuel=fuel,
+        engine=engine,
+        transmission=transmission,
+        photos=photos,
+        specs=specs,
+    )
