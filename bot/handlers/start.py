@@ -1,13 +1,16 @@
 import logging
 
-from aiogram import Router
-from aiogram.filters import CommandStart
+from aiogram import F, Router
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     URLInputFile,
 )
 from sqlalchemy import delete, select
@@ -15,7 +18,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from bot.config import settings
 from bot.db import Favorite, Request, async_session
-from bot.services.parser import fetch_offer_detail, fetch_offers
+from bot.services.parser import fetch_offer_detail
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -25,6 +28,20 @@ MAX_PHOTOS = 10
 
 # In-memory cache: offer_id -> (url, title, image_url)
 _offer_cache: dict[str, tuple[str, str, str]] = {}
+
+# Relay-chat state: manager_id -> {user_id, user_name, offer_title, request_type}
+_active_chat: dict[int, dict] = {}
+# Users currently in an active relay conversation
+_users_in_chat: set[int] = set()
+
+# Persistent keyboard shown to manager during an active relay conversation
+_chat_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="/end_chat"), KeyboardButton(text="/who")],
+        [KeyboardButton(text="/clients")],
+    ],
+    resize_keyboard=True,
+)
 
 
 def start_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -56,21 +73,15 @@ async def cmd_start(message: Message) -> None:
 async def cb_cars_available(callback: CallbackQuery) -> None:
     await callback.answer()
     msg = callback.message
-    await msg.answer("Завантаження...")
 
-    try:
-        offers = await fetch_offers()
-    except Exception as e:
-        logger.error("Failed to fetch offers: %s", e)
-        await msg.answer("Не вдалося завантажити автiвки. Спробуйте пiзнiше.")
-        return
+    from bot.services.poller import cached_offers
+    offers = cached_offers
 
     if not offers:
-        await msg.answer("Наразi немає доступних автiвок.")
+        await msg.answer("Наразi немає доступних автiвок. Зачекайте хвилину.")
         return
 
     for offer in offers[:MAX_OFFERS]:
-        _offer_cache[offer.id] = (offer.url, offer.title, offer.image_url)
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Переглянути авто", callback_data=f"detail:{offer.id}")],
         ])
@@ -248,7 +259,7 @@ async def _send_request(callback: CallbackQuery, request_type: str) -> None:
 
     # Save to DB
     async with async_session() as session:
-        session.add(Request(
+        req = Request(
             user_id=user.id,
             user_name=name,
             username=user.username or "",
@@ -256,8 +267,11 @@ async def _send_request(callback: CallbackQuery, request_type: str) -> None:
             offer_title=offer_title,
             offer_url=offer_url,
             request_type=request_type,
-        ))
+        )
+        session.add(req)
         await session.commit()
+        await session.refresh(req)
+        request_db_id = req.id
 
     # Notify manager
     type_label = "Замовлення" if request_type == "order" else "Уточнення деталей"
@@ -269,11 +283,15 @@ async def _send_request(callback: CallbackQuery, request_type: str) -> None:
         f"Клiєнт: {name}{username_str}\n"
         f"ID: <code>{user.id}</code>"
     )
+    reply_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Вiдповiсти", callback_data=f"reply:{request_db_id}")],
+    ])
     try:
         await callback.bot.send_message(
             settings.MANAGER_ID,
             manager_text,
             parse_mode="HTML",
+            reply_markup=reply_kb,
         )
     except Exception as e:
         logger.error("Failed to notify manager: %s", e)
@@ -328,7 +346,10 @@ async def cb_mgr_orders(callback: CallbackQuery) -> None:
             f"ID: <code>{req.user_id}</code>\n"
             f"Дата: {req.created_at:%Y-%m-%d %H:%M}"
         )
-        await callback.message.answer(text, parse_mode="HTML")
+        reply_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Вiдповiсти", callback_data=f"reply:{req.id}")],
+        ])
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=reply_kb)
 
 
 @router.callback_query(lambda c: c.data == "mgr_questions")
@@ -361,4 +382,176 @@ async def cb_mgr_questions(callback: CallbackQuery) -> None:
             f"ID: <code>{req.user_id}</code>\n"
             f"Дата: {req.created_at:%Y-%m-%d %H:%M}"
         )
-        await callback.message.answer(text, parse_mode="HTML")
+        reply_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Вiдповiсти", callback_data=f"reply:{req.id}")],
+        ])
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=reply_kb)
+
+
+# ── Relay chat ────────────────────────────────────────────
+
+
+@router.message(Command("clients"))
+async def cmd_clients(message: Message) -> None:
+    if message.from_user.id != settings.MANAGER_ID:
+        return
+
+    async with async_session() as session:
+        orders_result = await session.execute(
+            select(Request)
+            .where(Request.request_type == "order")
+            .order_by(Request.created_at.desc())
+            .limit(20)
+        )
+        orders = orders_result.scalars().all()
+
+        questions_result = await session.execute(
+            select(Request)
+            .where(Request.request_type == "question")
+            .order_by(Request.created_at.desc())
+            .limit(20)
+        )
+        questions = questions_result.scalars().all()
+
+    if not orders and not questions:
+        await message.answer("Немає запитiв вiд клiєнтiв.")
+        return
+
+    # Orders section
+    if orders:
+        order_buttons = []
+        for req in orders:
+            label = f"{req.user_name} — {req.offer_title[:30]}"
+            order_buttons.append(
+                [InlineKeyboardButton(text=label, callback_data=f"reply:{req.id}")]
+            )
+        order_kb = InlineKeyboardMarkup(inline_keyboard=order_buttons)
+        await message.answer("🛒 <b>Замовники:</b>", parse_mode="HTML", reply_markup=order_kb)
+
+    # Questions section
+    if questions:
+        question_buttons = []
+        for req in questions:
+            label = f"{req.user_name} — {req.offer_title[:30]}"
+            question_buttons.append(
+                [InlineKeyboardButton(text=label, callback_data=f"reply:{req.id}")]
+            )
+        question_kb = InlineKeyboardMarkup(inline_keyboard=question_buttons)
+        await message.answer("❓ <b>Уточнення:</b>", parse_mode="HTML", reply_markup=question_kb)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("reply:"))
+async def cb_reply_to_user(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.from_user.id != settings.MANAGER_ID:
+        return
+
+    request_id = int(callback.data.removeprefix("reply:"))
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(Request).where(Request.id == request_id)
+        )
+        req = result.scalar_one_or_none()
+
+    if not req:
+        await callback.message.answer("Запит не знайдено.")
+        return
+
+    # Close previous conversation if switching to a different user
+    old_chat = _active_chat.get(settings.MANAGER_ID)
+    if old_chat and old_chat["user_id"] != req.user_id:
+        _users_in_chat.discard(old_chat["user_id"])
+        await callback.message.answer(
+            f"Попередню розмову з {old_chat['user_name']} завершено."
+        )
+
+    _active_chat[settings.MANAGER_ID] = {
+        "user_id": req.user_id,
+        "user_name": req.user_name,
+        "offer_title": req.offer_title,
+        "request_type": req.request_type,
+    }
+    _users_in_chat.add(req.user_id)
+
+    type_label = "Замовлення" if req.request_type == "order" else "Уточнення"
+    await callback.message.answer(
+        f"💬 Розмова з <b>{req.user_name}</b>\n"
+        f"Тема: {type_label} — {req.offer_title}\n\n"
+        f"Пишiть повiдомлення, воно буде надiслане клiєнту.",
+        parse_mode="HTML",
+        reply_markup=_chat_keyboard,
+    )
+
+
+@router.message(Command("end_chat"))
+async def cmd_end_chat(message: Message) -> None:
+    if message.from_user.id != settings.MANAGER_ID:
+        return
+    chat_info = _active_chat.pop(settings.MANAGER_ID, None)
+    if chat_info:
+        _users_in_chat.discard(chat_info["user_id"])
+        await message.answer(
+            f"Розмову з {chat_info['user_name']} завершено.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        try:
+            await message.bot.send_message(
+                chat_info["user_id"],
+                "Менеджер завершив розмову. Якщо маєте додатковi питання, "
+                "натиснiть «Уточнити деталi» на сторiнцi авто.",
+            )
+        except Exception:
+            pass
+    else:
+        await message.answer("Немає активної розмови.")
+
+
+@router.message(Command("who"))
+async def cmd_who(message: Message) -> None:
+    if message.from_user.id != settings.MANAGER_ID:
+        return
+    chat_info = _active_chat.get(settings.MANAGER_ID)
+    if chat_info:
+        await message.answer(
+            f"Активна розмова з: <b>{chat_info['user_name']}</b>\n"
+            f"Тема: {chat_info['offer_title']}",
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer("Немає активної розмови.")
+
+
+@router.message(F.from_user.id == settings.MANAGER_ID, F.text, ~F.text.startswith("/"))
+async def mgr_relay_to_user(message: Message) -> None:
+    chat_info = _active_chat.get(settings.MANAGER_ID)
+    if not chat_info:
+        return
+
+    user_id = chat_info["user_id"]
+    try:
+        await message.bot.send_message(
+            user_id,
+            message.text,
+        )
+    except Exception as e:
+        logger.error("Failed to relay to user %s: %s", user_id, e)
+        await message.reply("❌ Не вдалося надiслати повiдомлення клiєнту.")
+
+
+@router.message(F.text)
+async def user_relay_to_manager(message: Message) -> None:
+    user_id = message.from_user.id
+    if user_id == settings.MANAGER_ID or user_id not in _users_in_chat:
+        return
+
+    chat_info = _active_chat.get(settings.MANAGER_ID)
+    if not chat_info or chat_info["user_id"] != user_id:
+        return
+
+    await message.bot.send_message(
+        settings.MANAGER_ID,
+        f"💬 <b>{chat_info['user_name']}</b>:\n\n"
+        f"{message.text}",
+        parse_mode="HTML",
+    )

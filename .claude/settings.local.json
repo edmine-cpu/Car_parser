@@ -6,7 +6,8 @@
       "Bash(python3 -m pip install:*)",
       "WebFetch(domain:autach.pl)",
       "Bash(source:*)",
-      "Bash(head:*)"
+      "Bash(head:*)",
+      "Bash(python:*)"
     ]
   }
 }

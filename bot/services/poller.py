@@ -13,6 +13,9 @@ POLL_INTERVAL = 60  # seconds
 # Set of known offer IDs (populated on first poll)
 _seen_ids: set[str] = set()
 
+# Cached latest offers (updated every poll)
+cached_offers: list[OfferItem] = []
+
 # Set of subscribed user chat IDs
 subscribers: set[int] = set()
 
@@ -50,11 +53,18 @@ async def poll_new_offers(bot: Bot) -> None:
     """Background task: fetch offers every minute, send new ones to subscribers."""
     global _seen_ids
 
-    # First run: populate seen IDs without sending
+    global _seen_ids, cached_offers
+
+    # First run: populate cache and seen IDs without sending
     try:
-        initial = await fetch_offers()
-        _seen_ids = {o.id for o in initial if o.id}
-        logger.info("Poller initialized with %d known offers", len(_seen_ids))
+        cached_offers = await fetch_offers()
+        _seen_ids = {o.id for o in cached_offers if o.id}
+
+        from bot.handlers.start import _offer_cache
+        for o in cached_offers:
+            _offer_cache[o.id] = (o.url, o.title, o.image_url)
+
+        logger.info("Poller initialized with %d offers", len(_seen_ids))
     except Exception as e:
         logger.error("Poller init failed: %s", e)
 
@@ -66,22 +76,23 @@ async def poll_new_offers(bot: Bot) -> None:
             logger.error("Poll failed: %s", e)
             continue
 
+        # Update cache
+        cached_offers = offers
+
+        from bot.handlers.start import _offer_cache
+        for o in offers:
+            _offer_cache[o.id] = (o.url, o.title, o.image_url)
+
         new_offers = [o for o in offers if o.id and o.id not in _seen_ids]
         if not new_offers:
             continue
 
         logger.info("Found %d new offers", len(new_offers))
 
-        # Update seen set
         for o in new_offers:
             _seen_ids.add(o.id)
 
-        # Update offer cache in handlers
-        from bot.handlers.start import _offer_cache
-        for o in new_offers:
-            _offer_cache[o.id] = (o.url, o.title, o.image_url)
-
-        # Send to all subscribers
+        # Send new ones to all subscribers
         for chat_id in list(subscribers):
             for offer in new_offers:
                 await _send_offer(bot, chat_id, offer)
