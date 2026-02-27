@@ -1,13 +1,14 @@
 import asyncio
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import httpx
 from bs4 import BeautifulSoup
 
 OFFERS_URLS = [
-    "https://autach.pl/offers?from=axa&sortby=new",
-    "https://autach.pl/offers?from=rest&sortby=new",
-    "https://autach.pl/offers?from=allianz&sortby=new",
+    "https://autach.pl/offers?from=axa&sortby=ending",
+    "https://autach.pl/offers?from=rest&sortby=ending",
+    "https://autach.pl/offers?from=allianz&sortby=ending",
 ]
 
 SPEC_MAP = {
@@ -20,6 +21,34 @@ SPEC_MAP = {
 }
 
 
+def format_remaining(seconds: int) -> str:
+    """Format seconds remaining as 'Xд Yг Zхв'."""
+    if seconds >= 999999:
+        return "невідомо"
+    d = seconds // 86400
+    h = (seconds % 86400) // 3600
+    m = (seconds % 3600) // 60
+    parts = []
+    if d:
+        parts.append(f"{d}д")
+    if h:
+        parts.append(f"{h}г")
+    parts.append(f"{m}хв")
+    return " ".join(parts)
+
+
+def _parse_auction_end(text: str) -> int:
+    """Parse 'YYYY-MM-DD HH:MM:SS' -> seconds remaining until auction end.
+    Returns 999999 on failure."""
+    try:
+        end_dt = datetime.strptime(text.strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        diff = (end_dt - now).total_seconds()
+        return max(0, int(diff))
+    except (ValueError, TypeError):
+        return 999999
+
+
 @dataclass
 class OfferItem:
     id: str
@@ -30,6 +59,7 @@ class OfferItem:
     url: str
     image_url: str
     source: str = ""
+    auction_end_seconds: int = 999999
 
 
 @dataclass
@@ -80,6 +110,8 @@ def _parse_cards(html: str, source: str) -> list[OfferItem]:
             elif label_text == "Data zakończenia":
                 auction_end = value_text
 
+        auction_end_seconds = _parse_auction_end(auction_end)
+
         link_el = card.select_one("a[href*='/offer/']")
         detail_url = link_el["href"] if link_el else ""
 
@@ -95,13 +127,14 @@ def _parse_cards(html: str, source: str) -> list[OfferItem]:
             url=detail_url,
             image_url=image_url,
             source=source,
+            auction_end_seconds=auction_end_seconds,
         ))
 
     return offers
 
 
 async def fetch_offers() -> list[OfferItem]:
-    """Fetch from all sources, merge, sort by auction_end desc (newest first)."""
+    """Fetch from all sources, merge, sort by auction_end_seconds ascending (most urgent first)."""
     async with httpx.AsyncClient(timeout=15) as client:
         tasks = [client.get(url) for url in OFFERS_URLS]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
@@ -122,8 +155,8 @@ async def fetch_offers() -> list[OfferItem]:
             seen.add(o.id)
             unique.append(o)
 
-    # Sort by auction_end descending (newest first)
-    unique.sort(key=lambda o: o.auction_end, reverse=True)
+    # Sort by auction_end_seconds ascending (most urgent first)
+    unique.sort(key=lambda o: o.auction_end_seconds)
     return unique
 
 

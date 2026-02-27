@@ -10,7 +10,6 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     URLInputFile,
 )
 from sqlalchemy import delete, select
@@ -18,7 +17,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from bot.config import settings
 from bot.db import Favorite, Request, async_session
-from bot.services.parser import fetch_offer_detail
+from bot.services.parser import fetch_offer_detail, format_remaining
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -35,10 +34,10 @@ _active_chat: dict[int, dict] = {}
 _users_in_chat: set[int] = set()
 
 # Persistent keyboard shown to manager during an active relay conversation
-_chat_keyboard = ReplyKeyboardMarkup(
+_mgr_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="/end_chat"), KeyboardButton(text="/who")],
-        [KeyboardButton(text="/clients")],
+        [KeyboardButton(text="Замовлення"), KeyboardButton(text="Уточнення")],
     ],
     resize_keyboard=True,
 )
@@ -64,6 +63,13 @@ async def cmd_start(message: Message) -> None:
     from bot.services.poller import subscribers
     subscribers.add(message.chat.id)
     await message.answer("Оберiть дiю:", reply_markup=start_keyboard(message.from_user.id))
+    if message.from_user.id == settings.MANAGER_ID:
+        await message.answer("\u200b", reply_markup=_mgr_keyboard)
+
+
+@router.message(Command("id"))
+async def cmd_id(message: Message) -> None:
+    await message.answer(f"<code>{message.from_user.id}</code>", parse_mode="HTML")
 
 
 # ── Car listing ────────────────────────────────────────────
@@ -74,23 +80,24 @@ async def cb_cars_available(callback: CallbackQuery) -> None:
     await callback.answer()
     msg = callback.message
 
-    from bot.services.poller import cached_offers
-    offers = cached_offers
+    from bot.services.poller import TWELVE_HOURS, cached_offers
+    offers = [o for o in cached_offers if o.auction_end_seconds < TWELVE_HOURS]
 
     if not offers:
-        await msg.answer("Наразi немає доступних автiвок. Зачекайте хвилину.")
+        await msg.answer("Наразi немає авто iз завершенням аукцiону менше нiж за 12 годин.")
         return
 
-    for offer in offers[:MAX_OFFERS]:
+    for offer in offers:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Переглянути авто", callback_data=f"detail:{offer.id}")],
         ])
+        remaining = format_remaining(offer.auction_end_seconds)
         caption = (
             f"<b>{offer.title}</b>\n"
             f"ID: {offer.id}\n"
             f"Рiк: {offer.year}\n"
             f"Пробiг: {offer.mileage} km\n"
-            f"Завершення: {offer.auction_end}"
+            f"Залишилось: {remaining}"
         )
         try:
             if offer.image_url:
@@ -423,7 +430,7 @@ async def cmd_clients(message: Message) -> None:
         for req in orders:
             label = f"{req.user_name} — {req.offer_title[:30]}"
             order_buttons.append(
-                [InlineKeyboardButton(text=label, callback_data=f"reply:{req.id}")]
+                [InlineKeyboardButton(text=label, callback_data=f"pick:{req.id}")]
             )
         order_kb = InlineKeyboardMarkup(inline_keyboard=order_buttons)
         await message.answer("🛒 <b>Замовники:</b>", parse_mode="HTML", reply_markup=order_kb)
@@ -434,10 +441,43 @@ async def cmd_clients(message: Message) -> None:
         for req in questions:
             label = f"{req.user_name} — {req.offer_title[:30]}"
             question_buttons.append(
-                [InlineKeyboardButton(text=label, callback_data=f"reply:{req.id}")]
+                [InlineKeyboardButton(text=label, callback_data=f"pick:{req.id}")]
             )
         question_kb = InlineKeyboardMarkup(inline_keyboard=question_buttons)
         await message.answer("❓ <b>Уточнення:</b>", parse_mode="HTML", reply_markup=question_kb)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("pick:"))
+async def cb_pick_request(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.from_user.id != settings.MANAGER_ID:
+        return
+
+    request_id = callback.data.removeprefix("pick:")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Написати", callback_data=f"reply:{request_id}"),
+            InlineKeyboardButton(text="Закрити", callback_data=f"close_req:{request_id}"),
+        ],
+    ])
+    await callback.message.answer("Оберiть дiю:", reply_markup=kb)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("close_req:"))
+async def cb_close_request(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.from_user.id != settings.MANAGER_ID:
+        return
+
+    request_id = int(callback.data.removeprefix("close_req:"))
+
+    async with async_session() as session:
+        await session.execute(
+            delete(Request).where(Request.id == request_id)
+        )
+        await session.commit()
+
+    await callback.message.edit_text("✅ Запит закрито.")
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("reply:"))
@@ -470,6 +510,7 @@ async def cb_reply_to_user(callback: CallbackQuery) -> None:
         "user_id": req.user_id,
         "user_name": req.user_name,
         "offer_title": req.offer_title,
+        "offer_url": req.offer_url,
         "request_type": req.request_type,
     }
     _users_in_chat.add(req.user_id)
@@ -480,7 +521,7 @@ async def cb_reply_to_user(callback: CallbackQuery) -> None:
         f"Тема: {type_label} — {req.offer_title}\n\n"
         f"Пишiть повiдомлення, воно буде надiслане клiєнту.",
         parse_mode="HTML",
-        reply_markup=_chat_keyboard,
+        reply_markup=_mgr_keyboard,
     )
 
 
@@ -491,18 +532,7 @@ async def cmd_end_chat(message: Message) -> None:
     chat_info = _active_chat.pop(settings.MANAGER_ID, None)
     if chat_info:
         _users_in_chat.discard(chat_info["user_id"])
-        await message.answer(
-            f"Розмову з {chat_info['user_name']} завершено.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        try:
-            await message.bot.send_message(
-                chat_info["user_id"],
-                "Менеджер завершив розмову. Якщо маєте додатковi питання, "
-                "натиснiть «Уточнити деталi» на сторiнцi авто.",
-            )
-        except Exception:
-            pass
+        await message.answer(f"Розмову з {chat_info['user_name']} завершено.")
     else:
         await message.answer("Немає активної розмови.")
 
@@ -513,13 +543,65 @@ async def cmd_who(message: Message) -> None:
         return
     chat_info = _active_chat.get(settings.MANAGER_ID)
     if chat_info:
+        url = chat_info.get("offer_url", "")
+        url_line = f"\nПосилання: {url}" if url else ""
         await message.answer(
             f"Активна розмова з: <b>{chat_info['user_name']}</b>\n"
-            f"Тема: {chat_info['offer_title']}",
+            f"Авто: {chat_info['offer_title']}{url_line}",
             parse_mode="HTML",
         )
     else:
         await message.answer("Немає активної розмови.")
+
+
+@router.message(F.from_user.id == settings.MANAGER_ID, F.text == "Замовлення")
+async def mgr_btn_orders(message: Message) -> None:
+    async with async_session() as session:
+        result = await session.execute(
+            select(Request)
+            .where(Request.request_type == "order")
+            .order_by(Request.created_at.desc())
+            .limit(20)
+        )
+        orders = result.scalars().all()
+
+    if not orders:
+        await message.answer("Замовлень поки немає.")
+        return
+
+    buttons = []
+    for req in orders:
+        label = f"{req.user_name} — {req.offer_title[:30]}"
+        buttons.append(
+            [InlineKeyboardButton(text=label, callback_data=f"pick:{req.id}")]
+        )
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer("🛒 <b>Замовники:</b>", parse_mode="HTML", reply_markup=kb)
+
+
+@router.message(F.from_user.id == settings.MANAGER_ID, F.text == "Уточнення")
+async def mgr_btn_questions(message: Message) -> None:
+    async with async_session() as session:
+        result = await session.execute(
+            select(Request)
+            .where(Request.request_type == "question")
+            .order_by(Request.created_at.desc())
+            .limit(20)
+        )
+        questions = result.scalars().all()
+
+    if not questions:
+        await message.answer("Запитiв на уточнення поки немає.")
+        return
+
+    buttons = []
+    for req in questions:
+        label = f"{req.user_name} — {req.offer_title[:30]}"
+        buttons.append(
+            [InlineKeyboardButton(text=label, callback_data=f"pick:{req.id}")]
+        )
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer("❓ <b>Уточнення:</b>", parse_mode="HTML", reply_markup=kb)
 
 
 @router.message(F.from_user.id == settings.MANAGER_ID, F.text, ~F.text.startswith("/"))
@@ -551,7 +633,5 @@ async def user_relay_to_manager(message: Message) -> None:
 
     await message.bot.send_message(
         settings.MANAGER_ID,
-        f"💬 <b>{chat_info['user_name']}</b>:\n\n"
-        f"{message.text}",
-        parse_mode="HTML",
+        message.text,
     )
