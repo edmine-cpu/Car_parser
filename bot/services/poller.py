@@ -1,11 +1,13 @@
 import asyncio
 import logging
 
+from datetime import datetime, timezone
+
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, URLInputFile
 from sqlalchemy import select
 
-from bot.db import Favorite, async_session
+from bot.db import Favorite, ManualCar, async_session
 from bot.services.parser import OfferItem, fetch_offers, format_remaining
 
 logger = logging.getLogger(__name__)
@@ -33,6 +35,39 @@ _notified_12h: set[str] = set()
 _notified_3h: set[str] = set()
 
 
+async def _load_manual_cars() -> list[OfferItem]:
+    """Load active manual cars from DB and convert to OfferItem."""
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                select(ManualCar).where(ManualCar.is_active == True)
+            )
+            cars = result.scalars().all()
+    except Exception as e:
+        logger.error("Failed to load manual cars: %s", e)
+        return []
+
+    items = []
+    now = datetime.now(timezone.utc)
+    for car in cars:
+        diff = (car.auction_end - now).total_seconds()
+        auction_end_seconds = max(0, int(diff))
+        if auction_end_seconds <= 0:
+            continue
+        items.append(OfferItem(
+            id=f"manual_{car.id}",
+            title=car.title,
+            year=car.year,
+            mileage=car.mileage,
+            auction_end=car.auction_end.strftime("%Y-%m-%d %H:%M:%S"),
+            url=car.url or "",
+            image_url=car.image_url or "",
+            source="Менеджер",
+            auction_end_seconds=auction_end_seconds,
+        ))
+    return items
+
+
 def _card_keyboard(offer: OfferItem) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Переглянути авто", callback_data=f"detail:{offer.id}")],
@@ -55,8 +90,12 @@ async def _send_offer(bot: Bot, chat_id: int, offer: OfferItem) -> None:
     keyboard = _card_keyboard(offer)
     try:
         if offer.image_url:
-            photo = URLInputFile(offer.image_url)
-            await bot.send_photo(chat_id, photo=photo, caption=caption, parse_mode="HTML", reply_markup=keyboard)
+            is_manual = offer.id.startswith("manual_")
+            if is_manual:
+                await bot.send_photo(chat_id, photo=offer.image_url, caption=caption, parse_mode="HTML", reply_markup=keyboard)
+            else:
+                photo = URLInputFile(offer.image_url)
+                await bot.send_photo(chat_id, photo=photo, caption=caption, parse_mode="HTML", reply_markup=keyboard)
         else:
             await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=keyboard)
     except Exception as e:
@@ -122,6 +161,12 @@ async def poll_new_offers(bot: Bot) -> None:
     # First run: populate cache and seen IDs without sending 12h notifications
     try:
         cached_offers = await _fetch_offers_safe()
+
+        # Merge manual cars from DB
+        manual = await _load_manual_cars()
+        cached_offers = cached_offers + manual
+        cached_offers.sort(key=lambda o: o.auction_end_seconds)
+
         _seen_ids = {o.id for o in cached_offers if o.id}
 
         # Mark all currently <12h offers as already notified (avoid spam on restart)
@@ -149,6 +194,11 @@ async def poll_new_offers(bot: Bot) -> None:
         except Exception as e:
             logger.error("Poll failed: %s", e)
             continue
+
+        # Merge manual cars from DB
+        manual = await _load_manual_cars()
+        offers = offers + manual
+        offers.sort(key=lambda o: o.auction_end_seconds)
 
         cached_offers = offers
 

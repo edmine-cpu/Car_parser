@@ -1,7 +1,7 @@
 import logging
 
 from aiogram import F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -16,8 +16,8 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from bot.config import settings
-from bot.db import Favorite, Request, async_session
-from bot.services.parser import fetch_offer_detail, format_remaining
+from bot.db import Favorite, ManualCar, Request, async_session
+from bot.services.parser import OfferDetail, fetch_offer_detail, format_remaining
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -40,6 +40,7 @@ _mgr_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="/end_chat"), KeyboardButton(text="/who")],
         [KeyboardButton(text="Замовлення"), KeyboardButton(text="Уточнення")],
+        [KeyboardButton(text="Додати авто")],
     ],
     resize_keyboard=True,
 )
@@ -60,6 +61,10 @@ def start_keyboard(user_id: int) -> InlineKeyboardMarkup:
         rows.append([
             InlineKeyboardButton(text="Замовлення", callback_data="mgr_orders"),
             InlineKeyboardButton(text="Уточнення", callback_data="mgr_questions"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="Додати авто", callback_data="mgr_add_car"),
+            InlineKeyboardButton(text="Мої авто", callback_data="mgr_my_cars"),
         ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -107,8 +112,12 @@ async def cb_cars_available(callback: CallbackQuery) -> None:
         )
         try:
             if offer.image_url:
-                photo = URLInputFile(offer.image_url)
-                await msg.answer_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=keyboard)
+                is_manual = offer.id.startswith("manual_")
+                if is_manual:
+                    await msg.answer_photo(photo=offer.image_url, caption=caption, parse_mode="HTML", reply_markup=keyboard)
+                else:
+                    photo = URLInputFile(offer.image_url)
+                    await msg.answer_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=keyboard)
             else:
                 await msg.answer(caption, parse_mode="HTML", reply_markup=keyboard)
         except Exception as e:
@@ -119,23 +128,54 @@ async def cb_cars_available(callback: CallbackQuery) -> None:
 # ── Car detail ─────────────────────────────────────────────
 
 
+async def _fetch_manual_car_detail(db_id: int) -> OfferDetail | None:
+    async with async_session() as session:
+        result = await session.execute(
+            select(ManualCar).where(ManualCar.id == db_id, ManualCar.is_active == True)
+        )
+        car = result.scalar_one_or_none()
+    if not car:
+        return None
+    photos = [car.image_url] if car.image_url else []
+    specs = {}
+    if car.price:
+        specs["Цiна"] = car.price
+    return OfferDetail(
+        title=car.title,
+        year=car.year,
+        mileage=car.mileage,
+        fuel=car.fuel,
+        engine=car.engine,
+        transmission=car.transmission,
+        photos=photos,
+        specs=specs,
+    )
+
+
 @router.callback_query(lambda c: c.data and c.data.startswith("detail:"))
 async def cb_offer_detail(callback: CallbackQuery) -> None:
     await callback.answer()
     msg = callback.message
     offer_id = callback.data.removeprefix("detail:")
-    cached = _offer_cache.get(offer_id)
-    if not cached:
-        await msg.answer("Лот не знайдено. Спробуйте оновити список.")
-        return
-    url, _, _ = cached
 
-    try:
-        detail = await fetch_offer_detail(url)
-    except Exception as e:
-        logger.error("Failed to fetch detail %s: %s", url, e)
-        await msg.answer("Не вдалося завантажити деталi. Спробуйте пiзнiше.")
-        return
+    is_manual = offer_id.startswith("manual_")
+
+    if is_manual:
+        db_id = int(offer_id.removeprefix("manual_"))
+        detail = await _fetch_manual_car_detail(db_id)
+    else:
+        cached = _offer_cache.get(offer_id)
+        if not cached:
+            await msg.answer("Лот не знайдено. Спробуйте оновити список.")
+            return
+        url, _, _ = cached
+
+        try:
+            detail = await fetch_offer_detail(url)
+        except Exception as e:
+            logger.error("Failed to fetch detail %s: %s", url, e)
+            await msg.answer("Не вдалося завантажити деталi. Спробуйте пiзнiше.")
+            return
 
     if not detail:
         await msg.answer("Деталi не знайдено.")
@@ -143,13 +183,20 @@ async def cb_offer_detail(callback: CallbackQuery) -> None:
 
     caption = (
         f"<b>{detail.title}</b>\n"
-        f"\U0001f1e8\U0001f1edАВТО Зi ШВЕЙЦАРIЇ\n\n"
+    )
+    if is_manual:
+        caption += "Додано менеджером\n\n"
+    else:
+        caption += "\U0001f1e8\U0001f1edАВТО Зi ШВЕЙЦАРIЇ\n\n"
+    caption += (
         f"☑️Рiк випуску: {detail.year}\n"
         f"☑️Вид палива: {detail.fuel}\n"
         f"☑️Об'єм двигуна: {detail.engine}\n"
         f"☑️Пробiг: {detail.mileage}\n"
         f"☑️Коробка передач: {detail.transmission}"
     )
+    if detail.specs.get("Цiна"):
+        caption += f"\n☑️Цiна: {detail.specs['Цiна']}"
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Замовити авто", callback_data=f"order:{offer_id}")],
@@ -160,14 +207,22 @@ async def cb_offer_detail(callback: CallbackQuery) -> None:
 
     photos = detail.photos[:MAX_PHOTOS]
     if photos:
-        media = [InputMediaPhoto(media=URLInputFile(p)) for p in photos]
-        media[0] = InputMediaPhoto(media=URLInputFile(photos[0]), caption=caption, parse_mode="HTML")
+        if is_manual:
+            # Manual cars store Telegram file_id, not URLs
+            media = [InputMediaPhoto(media=p) for p in photos]
+            media[0] = InputMediaPhoto(media=photos[0], caption=caption, parse_mode="HTML")
+        else:
+            media = [InputMediaPhoto(media=URLInputFile(p)) for p in photos]
+            media[0] = InputMediaPhoto(media=URLInputFile(photos[0]), caption=caption, parse_mode="HTML")
         try:
             await msg.answer_media_group(media=media)
         except Exception as e:
             logger.warning("Media group failed: %s", e)
             try:
-                await msg.answer_photo(photo=URLInputFile(photos[0]), caption=caption, parse_mode="HTML")
+                if is_manual:
+                    await msg.answer_photo(photo=photos[0], caption=caption, parse_mode="HTML")
+                else:
+                    await msg.answer_photo(photo=URLInputFile(photos[0]), caption=caption, parse_mode="HTML")
             except Exception:
                 await msg.answer(caption, parse_mode="HTML")
 
@@ -226,10 +281,13 @@ async def cb_cars_favorites(callback: CallbackQuery) -> None:
         return
 
     for fav in favs:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Переглянути авто", url=fav.url)],
-            [InlineKeyboardButton(text="Видалити з обраних", callback_data=f"unfav:{fav.offer_id}")],
-        ])
+        buttons = []
+        if fav.url and fav.url.startswith("http"):
+            buttons.append([InlineKeyboardButton(text="Переглянути авто", url=fav.url)])
+        else:
+            buttons.append([InlineKeyboardButton(text="Переглянути авто", callback_data=f"detail:{fav.offer_id}")])
+        buttons.append([InlineKeyboardButton(text="Видалити з обраних", callback_data=f"unfav:{fav.offer_id}")])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
         caption = f"⭐ <b>{fav.title}</b>\nID: {fav.offer_id}"
         try:
             if fav.image_url:
@@ -630,7 +688,7 @@ async def mgr_btn_questions(message: Message) -> None:
     await message.answer("❓ <b>Уточнення:</b>", parse_mode="HTML", reply_markup=kb)
 
 
-@router.message(lambda m: _is_manager(m.from_user.id), F.text, ~F.text.startswith("/"))
+@router.message(lambda m: _is_manager(m.from_user.id), F.text, ~F.text.startswith("/"), StateFilter(None))
 async def mgr_relay_to_user(message: Message) -> None:
     chat_info = _active_chat.get(message.from_user.id)
     if not chat_info:

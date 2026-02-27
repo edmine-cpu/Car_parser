@@ -5,6 +5,7 @@ from aiogram import Bot, Dispatcher
 
 from bot.config import settings
 from bot.db import Base, engine
+from bot.handlers.add_car import router as add_car_router
 from bot.handlers.start import router as start_router
 from bot.services.poller import poll_new_offers
 
@@ -18,6 +19,7 @@ async def main() -> None:
 
     bot = Bot(token=settings.BOT_TOKEN)
     dp = Dispatcher()
+    dp.include_router(add_car_router)
     dp.include_router(start_router)
 
     # Start background poller

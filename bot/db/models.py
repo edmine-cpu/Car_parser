@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, String, Text, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, DateTime, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -60,3 +60,27 @@ class Request(Base):
 
     def __repr__(self) -> str:
         return f"<Request {self.id} {self.request_type} {self.user_name}>"
+
+
+class ManualCar(Base):
+    __tablename__ = "manual_cars"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(512))
+    year: Mapped[str] = mapped_column(String(32))
+    mileage: Mapped[str] = mapped_column(String(64))
+    fuel: Mapped[str] = mapped_column(String(128), default="")
+    engine: Mapped[str] = mapped_column(String(128), default="")
+    transmission: Mapped[str] = mapped_column(String(128), default="")
+    price: Mapped[str] = mapped_column(String(128), default="")
+    auction_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    image_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    added_by: Mapped[int] = mapped_column(BigInteger)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    def __repr__(self) -> str:
+        return f"<ManualCar {self.id} {self.title!r}>"
