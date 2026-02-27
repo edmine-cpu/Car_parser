@@ -6,8 +6,11 @@ class Settings(BaseSettings):
 
     BOT_TOKEN: str
     DATABASE_URL: str
-    MANAGER_ID: int
+    MANAGER_IDS: str = ""  # comma-separated: "123,456"
+
+    @property
+    def manager_ids(self) -> set[int]:
+        return {int(x.strip()) for x in self.MANAGER_IDS.split(",") if x.strip()}
 
 
 settings = Settings()
-

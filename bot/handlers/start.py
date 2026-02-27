@@ -28,10 +28,12 @@ MAX_PHOTOS = 10
 # In-memory cache: offer_id -> (url, title, image_url)
 _offer_cache: dict[str, tuple[str, str, str]] = {}
 
-# Relay-chat state: manager_id -> {user_id, user_name, offer_title, request_type}
+# Relay-chat state: manager_id -> {user_id, user_name, offer_title, request_type, offer_url}
 _active_chat: dict[int, dict] = {}
 # Users currently in an active relay conversation
 _users_in_chat: set[int] = set()
+# Reverse mapping: user_id -> manager_id who is chatting with them
+_user_to_manager: dict[int, int] = {}
 
 # Persistent keyboard shown to manager during an active relay conversation
 _mgr_keyboard = ReplyKeyboardMarkup(
@@ -43,6 +45,10 @@ _mgr_keyboard = ReplyKeyboardMarkup(
 )
 
 
+def _is_manager(user_id: int) -> bool:
+    return user_id in settings.manager_ids
+
+
 def start_keyboard(user_id: int) -> InlineKeyboardMarkup:
     rows = [
         [
@@ -50,7 +56,7 @@ def start_keyboard(user_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="Показати обранi", callback_data="cars_favorites"),
         ],
     ]
-    if user_id == settings.MANAGER_ID:
+    if _is_manager(user_id):
         rows.append([
             InlineKeyboardButton(text="Замовлення", callback_data="mgr_orders"),
             InlineKeyboardButton(text="Уточнення", callback_data="mgr_questions"),
@@ -63,8 +69,8 @@ async def cmd_start(message: Message) -> None:
     from bot.services.poller import subscribers
     subscribers.add(message.chat.id)
     await message.answer("Оберiть дiю:", reply_markup=start_keyboard(message.from_user.id))
-    if message.from_user.id == settings.MANAGER_ID:
-        await message.answer("\u200b", reply_markup=_mgr_keyboard)
+    if _is_manager(message.from_user.id):
+        await message.answer("Панель менеджера:", reply_markup=_mgr_keyboard)
 
 
 @router.message(Command("id"))
@@ -280,7 +286,7 @@ async def _send_request(callback: CallbackQuery, request_type: str) -> None:
         await session.refresh(req)
         request_db_id = req.id
 
-    # Notify manager
+    # Notify all managers
     type_label = "Замовлення" if request_type == "order" else "Уточнення деталей"
     manager_text = (
         f"{'🛒' if request_type == 'order' else '❓'} <b>{type_label}</b>\n\n"
@@ -293,15 +299,20 @@ async def _send_request(callback: CallbackQuery, request_type: str) -> None:
     reply_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Вiдповiсти", callback_data=f"reply:{request_db_id}")],
     ])
-    try:
-        await callback.bot.send_message(
-            settings.MANAGER_ID,
-            manager_text,
-            parse_mode="HTML",
-            reply_markup=reply_kb,
-        )
-    except Exception as e:
-        logger.error("Failed to notify manager: %s", e)
+    sent = False
+    for mgr_id in settings.manager_ids:
+        try:
+            await callback.bot.send_message(
+                mgr_id,
+                manager_text,
+                parse_mode="HTML",
+                reply_markup=reply_kb,
+            )
+            sent = True
+        except Exception as e:
+            logger.error("Failed to notify manager %s: %s", mgr_id, e)
+
+    if not sent:
         await callback.message.answer("Не вдалося надiслати запит. Спробуйте пiзнiше.")
         return
 
@@ -326,7 +337,7 @@ async def cb_ask(callback: CallbackQuery) -> None:
 @router.callback_query(lambda c: c.data == "mgr_orders")
 async def cb_mgr_orders(callback: CallbackQuery) -> None:
     await callback.answer()
-    if callback.from_user.id != settings.MANAGER_ID:
+    if not _is_manager(callback.from_user.id):
         return
 
     async with async_session() as session:
@@ -362,7 +373,7 @@ async def cb_mgr_orders(callback: CallbackQuery) -> None:
 @router.callback_query(lambda c: c.data == "mgr_questions")
 async def cb_mgr_questions(callback: CallbackQuery) -> None:
     await callback.answer()
-    if callback.from_user.id != settings.MANAGER_ID:
+    if not _is_manager(callback.from_user.id):
         return
 
     async with async_session() as session:
@@ -400,7 +411,7 @@ async def cb_mgr_questions(callback: CallbackQuery) -> None:
 
 @router.message(Command("clients"))
 async def cmd_clients(message: Message) -> None:
-    if message.from_user.id != settings.MANAGER_ID:
+    if not _is_manager(message.from_user.id):
         return
 
     async with async_session() as session:
@@ -450,7 +461,7 @@ async def cmd_clients(message: Message) -> None:
 @router.callback_query(lambda c: c.data and c.data.startswith("pick:"))
 async def cb_pick_request(callback: CallbackQuery) -> None:
     await callback.answer()
-    if callback.from_user.id != settings.MANAGER_ID:
+    if not _is_manager(callback.from_user.id):
         return
 
     request_id = callback.data.removeprefix("pick:")
@@ -466,7 +477,7 @@ async def cb_pick_request(callback: CallbackQuery) -> None:
 @router.callback_query(lambda c: c.data and c.data.startswith("close_req:"))
 async def cb_close_request(callback: CallbackQuery) -> None:
     await callback.answer()
-    if callback.from_user.id != settings.MANAGER_ID:
+    if not _is_manager(callback.from_user.id):
         return
 
     request_id = int(callback.data.removeprefix("close_req:"))
@@ -483,7 +494,8 @@ async def cb_close_request(callback: CallbackQuery) -> None:
 @router.callback_query(lambda c: c.data and c.data.startswith("reply:"))
 async def cb_reply_to_user(callback: CallbackQuery) -> None:
     await callback.answer()
-    if callback.from_user.id != settings.MANAGER_ID:
+    manager_id = callback.from_user.id
+    if not _is_manager(manager_id):
         return
 
     request_id = int(callback.data.removeprefix("reply:"))
@@ -498,15 +510,26 @@ async def cb_reply_to_user(callback: CallbackQuery) -> None:
         await callback.message.answer("Запит не знайдено.")
         return
 
-    # Close previous conversation if switching to a different user
-    old_chat = _active_chat.get(settings.MANAGER_ID)
+    # Protection: check if another manager is already chatting with this user
+    if req.user_id in _users_in_chat:
+        other_mgr = _user_to_manager.get(req.user_id)
+        if other_mgr and other_mgr != manager_id:
+            await callback.message.answer(
+                "⚠️ Цей клiєнт вже в розмовi з iншим менеджером."
+            )
+            return
+
+    # Close previous conversation if this manager is switching to a different user
+    old_chat = _active_chat.get(manager_id)
     if old_chat and old_chat["user_id"] != req.user_id:
-        _users_in_chat.discard(old_chat["user_id"])
+        old_user_id = old_chat["user_id"]
+        _users_in_chat.discard(old_user_id)
+        _user_to_manager.pop(old_user_id, None)
         await callback.message.answer(
             f"Попередню розмову з {old_chat['user_name']} завершено."
         )
 
-    _active_chat[settings.MANAGER_ID] = {
+    _active_chat[manager_id] = {
         "user_id": req.user_id,
         "user_name": req.user_name,
         "offer_title": req.offer_title,
@@ -514,6 +537,7 @@ async def cb_reply_to_user(callback: CallbackQuery) -> None:
         "request_type": req.request_type,
     }
     _users_in_chat.add(req.user_id)
+    _user_to_manager[req.user_id] = manager_id
 
     type_label = "Замовлення" if req.request_type == "order" else "Уточнення"
     await callback.message.answer(
@@ -527,11 +551,13 @@ async def cb_reply_to_user(callback: CallbackQuery) -> None:
 
 @router.message(Command("end_chat"))
 async def cmd_end_chat(message: Message) -> None:
-    if message.from_user.id != settings.MANAGER_ID:
+    if not _is_manager(message.from_user.id):
         return
-    chat_info = _active_chat.pop(settings.MANAGER_ID, None)
+    chat_info = _active_chat.pop(message.from_user.id, None)
     if chat_info:
-        _users_in_chat.discard(chat_info["user_id"])
+        user_id = chat_info["user_id"]
+        _users_in_chat.discard(user_id)
+        _user_to_manager.pop(user_id, None)
         await message.answer(f"Розмову з {chat_info['user_name']} завершено.")
     else:
         await message.answer("Немає активної розмови.")
@@ -539,9 +565,9 @@ async def cmd_end_chat(message: Message) -> None:
 
 @router.message(Command("who"))
 async def cmd_who(message: Message) -> None:
-    if message.from_user.id != settings.MANAGER_ID:
+    if not _is_manager(message.from_user.id):
         return
-    chat_info = _active_chat.get(settings.MANAGER_ID)
+    chat_info = _active_chat.get(message.from_user.id)
     if chat_info:
         url = chat_info.get("offer_url", "")
         url_line = f"\nПосилання: {url}" if url else ""
@@ -554,7 +580,7 @@ async def cmd_who(message: Message) -> None:
         await message.answer("Немає активної розмови.")
 
 
-@router.message(F.from_user.id == settings.MANAGER_ID, F.text == "Замовлення")
+@router.message(lambda m: _is_manager(m.from_user.id), F.text == "Замовлення")
 async def mgr_btn_orders(message: Message) -> None:
     async with async_session() as session:
         result = await session.execute(
@@ -579,7 +605,7 @@ async def mgr_btn_orders(message: Message) -> None:
     await message.answer("🛒 <b>Замовники:</b>", parse_mode="HTML", reply_markup=kb)
 
 
-@router.message(F.from_user.id == settings.MANAGER_ID, F.text == "Уточнення")
+@router.message(lambda m: _is_manager(m.from_user.id), F.text == "Уточнення")
 async def mgr_btn_questions(message: Message) -> None:
     async with async_session() as session:
         result = await session.execute(
@@ -604,9 +630,9 @@ async def mgr_btn_questions(message: Message) -> None:
     await message.answer("❓ <b>Уточнення:</b>", parse_mode="HTML", reply_markup=kb)
 
 
-@router.message(F.from_user.id == settings.MANAGER_ID, F.text, ~F.text.startswith("/"))
+@router.message(lambda m: _is_manager(m.from_user.id), F.text, ~F.text.startswith("/"))
 async def mgr_relay_to_user(message: Message) -> None:
-    chat_info = _active_chat.get(settings.MANAGER_ID)
+    chat_info = _active_chat.get(message.from_user.id)
     if not chat_info:
         return
 
@@ -624,14 +650,14 @@ async def mgr_relay_to_user(message: Message) -> None:
 @router.message(F.text)
 async def user_relay_to_manager(message: Message) -> None:
     user_id = message.from_user.id
-    if user_id == settings.MANAGER_ID or user_id not in _users_in_chat:
+    if _is_manager(user_id) or user_id not in _users_in_chat:
         return
 
-    chat_info = _active_chat.get(settings.MANAGER_ID)
-    if not chat_info or chat_info["user_id"] != user_id:
+    target_mgr = _user_to_manager.get(user_id)
+    if not target_mgr:
         return
 
     await message.bot.send_message(
-        settings.MANAGER_ID,
+        target_mgr,
         message.text,
     )
