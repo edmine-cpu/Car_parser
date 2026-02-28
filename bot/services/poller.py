@@ -173,9 +173,10 @@ async def poll_new_offers(bot: Bot) -> None:
 
         _seen_ids = {o.id for o in cached_offers if o.id}
 
-        # Mark all currently <12h offers as already notified (avoid spam on restart)
+        # Mark all currently <12h parsed offers as already notified (avoid spam on restart)
+        # Manual cars are NOT marked — they should get notified after restart
         for o in cached_offers:
-            if o.auction_end_seconds < TWELVE_HOURS:
+            if o.auction_end_seconds < TWELVE_HOURS and not o.id.startswith("manual_"):
                 _notified_12h.add(o.id)
 
         from bot.handlers.start import _offer_cache
