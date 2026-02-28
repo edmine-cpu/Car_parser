@@ -99,7 +99,11 @@ async def _send_offer(bot: Bot, chat_id: int, offer: OfferItem) -> None:
         else:
             await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=keyboard)
     except Exception as e:
-        logger.warning("Failed to send offer %s to %s: %s", offer.id, chat_id, e)
+        logger.warning("Failed to send offer photo %s to %s: %s, falling back to text", offer.id, chat_id, e)
+        try:
+            await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=keyboard)
+        except Exception as e2:
+            logger.warning("Fallback text also failed for %s to %s: %s", offer.id, chat_id, e2)
 
 
 async def _check_favorites_3h(bot: Bot, notify: bool = True) -> None:
@@ -195,25 +199,28 @@ async def poll_new_offers(bot: Bot) -> None:
             logger.error("Poll failed: %s", e)
             continue
 
-        # Merge manual cars from DB
-        manual = await _load_manual_cars()
-        offers = offers + manual
-        offers.sort(key=lambda o: o.auction_end_seconds)
+        try:
+            # Merge manual cars from DB
+            manual = await _load_manual_cars()
+            offers = offers + manual
+            offers.sort(key=lambda o: o.auction_end_seconds)
 
-        cached_offers = offers
+            cached_offers = offers
 
-        from bot.handlers.start import _offer_cache
-        for o in offers:
-            _offer_cache[o.id] = (o.url, o.title, o.image_url)
-            _seen_ids.add(o.id)
+            from bot.handlers.start import _offer_cache
+            for o in offers:
+                _offer_cache[o.id] = (o.url, o.title, o.image_url)
+                _seen_ids.add(o.id)
 
-        # Send 12h notifications for offers that just crossed the 12h threshold
-        for offer in offers:
-            if offer.auction_end_seconds < TWELVE_HOURS and offer.id not in _notified_12h:
-                _notified_12h.add(offer.id)
-                logger.info("12h alert for offer %s (%s)", offer.id, offer.auction_end)
-                for chat_id in list(subscribers):
-                    await _send_offer(bot, chat_id, offer)
+            # Send 12h notifications for offers that just crossed the 12h threshold
+            for offer in offers:
+                if offer.auction_end_seconds < TWELVE_HOURS and offer.id not in _notified_12h:
+                    _notified_12h.add(offer.id)
+                    logger.info("12h alert for offer %s (%s)", offer.id, offer.auction_end)
+                    for chat_id in list(subscribers):
+                        await _send_offer(bot, chat_id, offer)
 
-        # Check favorites for 3h notifications
-        await _check_favorites_3h(bot, notify=True)
+            # Check favorites for 3h notifications
+            await _check_favorites_3h(bot, notify=True)
+        except Exception as e:
+            logger.error("Post-fetch processing failed: %s", e)

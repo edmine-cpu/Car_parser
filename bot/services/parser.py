@@ -1,9 +1,12 @@
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import httpx
 from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)
 
 OFFERS_URLS = [
     "https://autach.pl/offers?from=axa&sortby=ending",
@@ -143,8 +146,11 @@ async def fetch_offers() -> list[OfferItem]:
     sources = ["AXA", "REST", "Allianz"]
     for resp, source in zip(responses, sources):
         if isinstance(resp, Exception):
+            logger.warning("Source %s fetch error: %s", source, resp)
             continue
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            logger.warning("Source %s returned HTTP %s", source, resp.status_code)
+            continue
         all_offers.extend(_parse_cards(resp.text, source))
 
     # Deduplicate by offer ID
