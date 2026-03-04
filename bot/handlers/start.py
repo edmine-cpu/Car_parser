@@ -91,11 +91,11 @@ async def cb_cars_available(callback: CallbackQuery) -> None:
     await callback.answer()
     msg = callback.message
 
-    from bot.services.poller import TWELVE_HOURS, cached_offers
-    offers = [o for o in cached_offers if o.auction_end_seconds < TWELVE_HOURS]
+    from bot.services.poller import FORTY_EIGHT_HOURS, cached_offers
+    offers = [o for o in cached_offers if o.auction_end_seconds < FORTY_EIGHT_HOURS]
 
     if not offers:
-        await msg.answer("Наразi немає авто iз завершенням аукцiону менше нiж за 12 годин.")
+        await msg.answer("Наразi немає авто iз завершенням аукцiону менше нiж за 120 годин.")
         return
 
     for offer in offers:

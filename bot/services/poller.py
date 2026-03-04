@@ -13,7 +13,7 @@ from bot.services.parser import OfferItem, fetch_offers, format_remaining
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL = 180  # 3 minutes
-TWELVE_HOURS = 12 * 3600
+FORTY_EIGHT_HOURS = 120 * 3600
 THREE_HOURS = 3 * 3600
 
 # Prevent concurrent HTTP fetches
@@ -27,9 +27,6 @@ cached_offers: list[OfferItem] = []
 
 # Set of subscribed user chat IDs
 subscribers: set[int] = set()
-
-# offer_id -> already sent the 12h notification
-_notified_12h: set[str] = set()
 
 # "user_id:offer_id" -> already sent the 3h favorite notification
 _notified_3h: set[str] = set()
@@ -173,12 +170,6 @@ async def poll_new_offers(bot: Bot) -> None:
 
         _seen_ids = {o.id for o in cached_offers if o.id}
 
-        # Mark all currently <12h parsed offers as already notified (avoid spam on restart)
-        # Manual cars are NOT marked — they should get notified after restart
-        for o in cached_offers:
-            if o.auction_end_seconds < TWELVE_HOURS and not o.id.startswith("manual_"):
-                _notified_12h.add(o.id)
-
         from bot.handlers.start import _offer_cache
         for o in cached_offers:
             _offer_cache[o.id] = (o.url, o.title, o.image_url)
@@ -186,9 +177,9 @@ async def poll_new_offers(bot: Bot) -> None:
         # Mark 3h favorites without sending (avoid spam on restart)
         await _check_favorites_3h(bot, notify=False)
 
-        logger.info("Poller initialized with %d offers (%d under 12h)",
+        logger.info("Poller initialized with %d offers (%d under 48h)",
                     len(_seen_ids),
-                    sum(1 for o in cached_offers if o.auction_end_seconds < TWELVE_HOURS))
+                    sum(1 for o in cached_offers if o.auction_end_seconds < FORTY_EIGHT_HOURS))
     except Exception as e:
         logger.error("Poller init failed: %s", e)
 
@@ -212,14 +203,6 @@ async def poll_new_offers(bot: Bot) -> None:
             for o in offers:
                 _offer_cache[o.id] = (o.url, o.title, o.image_url)
                 _seen_ids.add(o.id)
-
-            # Send 12h notifications for offers that just crossed the 12h threshold
-            for offer in offers:
-                if offer.auction_end_seconds < TWELVE_HOURS and offer.id not in _notified_12h:
-                    _notified_12h.add(offer.id)
-                    logger.info("12h alert for offer %s (%s)", offer.id, offer.auction_end)
-                    for chat_id in list(subscribers):
-                        await _send_offer(bot, chat_id, offer)
 
             # Check favorites for 3h notifications
             await _check_favorites_3h(bot, notify=True)
