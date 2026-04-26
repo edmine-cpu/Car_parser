@@ -33,6 +33,9 @@ _offer_cache: dict[str, tuple[str, str, str]] = {}
 # user_id -> list of message_ids that constitute the current "available cars" page
 _cars_page_messages: dict[int, list[int]] = {}
 
+# user_id -> last viewed cars-list page index (for "return to page N" button)
+_last_cars_page: dict[int, int] = {}
+
 # user_id -> list of message_ids that constitute the current offer-detail view
 _detail_messages: dict[int, list[int]] = {}
 
@@ -61,13 +64,19 @@ def _is_manager(user_id: int) -> bool:
     return user_id in settings.manager_ids
 
 
-def start_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton(text="Наявнi автiвки", callback_data="cars_available"),
-            InlineKeyboardButton(text="Показати обранi", callback_data="cars_favorites"),
-        ],
-    ]
+def start_keyboard(user_id: int, last_page: int | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if last_page is not None:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"↩ Повернутись до сторiнки {last_page + 1}",
+                callback_data=f"cars_page:{last_page}",
+            ),
+        ])
+    rows.append([
+        InlineKeyboardButton(text="Наявнi автiвки", callback_data="cars_available"),
+        InlineKeyboardButton(text="Показати обранi", callback_data="cars_favorites"),
+    ])
     if _is_manager(user_id):
         rows.append([
             InlineKeyboardButton(text="Замовлення", callback_data="mgr_orders"),
@@ -139,6 +148,7 @@ async def _render_cars_page(callback: CallbackQuery, page: int) -> None:
     start = page * PAGE_SIZE
     end = start + PAGE_SIZE
     page_offers = offers[start:end]
+    _last_cars_page[user_id] = page
 
     sent_ids: list[int] = []
 
@@ -230,7 +240,10 @@ async def cb_main_menu(callback: CallbackQuery) -> None:
             await bot.delete_message(chat_id, mid)
         except Exception as e:
             logger.debug("main_menu delete %s failed: %s", mid, e)
-    await callback.message.answer("Оберiть дiю:", reply_markup=start_keyboard(user_id))
+    last_page = _last_cars_page.get(user_id)
+    await callback.message.answer(
+        "Оберiть дiю:", reply_markup=start_keyboard(user_id, last_page=last_page)
+    )
 
 
 # ── Car detail ─────────────────────────────────────────────
