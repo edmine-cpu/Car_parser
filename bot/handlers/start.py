@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 MAX_OFFERS = 10
 MAX_PHOTOS = 10
-PAGE_SIZE = 10
+PAGE_SIZE = 30
 
 # In-memory cache: offer_id -> (url, title, image_url)
 _offer_cache: dict[str, tuple[str, str, str]] = {}
@@ -183,7 +183,7 @@ async def _render_cars_page(callback: CallbackQuery, page: int) -> None:
         )
         nav_rows.append([
             prev_btn,
-            InlineKeyboardButton(text=f"Сторiнка {page + 1} з {total_pages}", callback_data="noop"),
+            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"),
             next_btn,
         ])
     nav_rows.append([
