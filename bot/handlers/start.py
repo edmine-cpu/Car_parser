@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from aiogram import F, Router
@@ -34,6 +35,9 @@ _cars_page_messages: dict[int, list[int]] = {}
 
 # user_id -> list of message_ids that constitute the current offer-detail view
 _detail_messages: dict[int, list[int]] = {}
+
+# user_id -> list of message_ids that constitute the current favorites listing
+_favorites_messages: dict[int, list[int]] = {}
 
 # Relay-chat state: manager_id -> {user_id, user_name, offer_title, request_type, offer_url}
 _active_chat: dict[int, dict] = {}
@@ -102,6 +106,15 @@ async def _clear_previous_cars_page(bot, chat_id: int, user_id: int) -> None:
             logger.debug("delete_message %s failed: %s", mid, e)
 
 
+async def _clear_previous_favorites(bot, chat_id: int, user_id: int) -> None:
+    ids = _favorites_messages.pop(user_id, [])
+    for mid in ids:
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception as e:
+            logger.debug("delete fav msg %s failed: %s", mid, e)
+
+
 async def _render_cars_page(callback: CallbackQuery, page: int) -> None:
     msg = callback.message
     user_id = callback.from_user.id
@@ -156,6 +169,7 @@ async def _render_cars_page(callback: CallbackQuery, page: int) -> None:
             sent = await msg.answer(caption, parse_mode="HTML", reply_markup=keyboard)
         sent_ids.append(sent.message_id)
 
+    nav_rows: list[list[InlineKeyboardButton]] = []
     if total_pages > 1:
         prev_btn = (
             InlineKeyboardButton(text="◀ Назад", callback_data=f"cars_page:{page - 1}")
@@ -167,13 +181,17 @@ async def _render_cars_page(callback: CallbackQuery, page: int) -> None:
             if page < total_pages - 1
             else InlineKeyboardButton(text="·", callback_data="noop")
         )
-        nav_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        nav_rows.append([
             prev_btn,
             InlineKeyboardButton(text=f"Сторiнка {page + 1} з {total_pages}", callback_data="noop"),
             next_btn,
-        ]])
-        nav_msg = await msg.answer("Виберiть сторiнку:", reply_markup=nav_kb)
-        sent_ids.append(nav_msg.message_id)
+        ])
+    nav_rows.append([
+        InlineKeyboardButton(text="🏠 Головне меню", callback_data="main_menu"),
+    ])
+    nav_kb = InlineKeyboardMarkup(inline_keyboard=nav_rows)
+    nav_msg = await msg.answer("Навiгацiя:", reply_markup=nav_kb)
+    sent_ids.append(nav_msg.message_id)
 
     _cars_page_messages[user_id] = sent_ids
 
@@ -197,6 +215,22 @@ async def cb_cars_page(callback: CallbackQuery) -> None:
 @router.callback_query(lambda c: c.data == "noop")
 async def cb_noop(callback: CallbackQuery) -> None:
     await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "main_menu")
+async def cb_main_menu(callback: CallbackQuery) -> None:
+    await callback.answer()
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    bot = callback.bot
+    await _clear_previous_cars_page(bot, chat_id, user_id)
+    detail_ids = _detail_messages.pop(user_id, [])
+    for mid in detail_ids:
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception as e:
+            logger.debug("main_menu delete %s failed: %s", mid, e)
+    await callback.message.answer("Оберiть дiю:", reply_markup=start_keyboard(user_id))
 
 
 # ── Car detail ─────────────────────────────────────────────
@@ -359,13 +393,26 @@ async def cb_add_fav(callback: CallbackQuery) -> None:
         await session.execute(stmt)
         await session.commit()
 
-    await callback.message.answer("⭐ Додано в обранi!")
+    sent = await callback.message.answer("⭐ Додано в обранi!")
+
+    async def _delete_later() -> None:
+        await asyncio.sleep(3)
+        try:
+            await sent.delete()
+        except Exception as e:
+            logger.debug("auto-delete fav msg failed: %s", e)
+
+    asyncio.create_task(_delete_later())
 
 
 @router.callback_query(lambda c: c.data == "cars_favorites")
 async def cb_cars_favorites(callback: CallbackQuery) -> None:
     await callback.answer()
     user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    bot = callback.bot
+
+    await _clear_previous_favorites(bot, chat_id, user_id)
 
     async with async_session() as session:
         result = await session.execute(
@@ -373,8 +420,16 @@ async def cb_cars_favorites(callback: CallbackQuery) -> None:
         )
         favs = result.scalars().all()
 
+    sent_ids: list[int] = []
+    close_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✖ Закрити", callback_data="close_favs")],
+    ])
+
     if not favs:
-        await callback.message.answer("У вас поки немає обраних автiвок.")
+        empty_msg = await callback.message.answer(
+            "У вас поки немає обраних автiвок.", reply_markup=close_kb
+        )
+        _favorites_messages[user_id] = [empty_msg.message_id]
         return
 
     for fav in favs:
@@ -389,12 +444,27 @@ async def cb_cars_favorites(callback: CallbackQuery) -> None:
         try:
             if fav.image_url:
                 photo = URLInputFile(fav.image_url)
-                await callback.message.answer_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=keyboard)
+                sent = await callback.message.answer_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=keyboard)
             else:
-                await callback.message.answer(caption, parse_mode="HTML", reply_markup=keyboard)
+                sent = await callback.message.answer(caption, parse_mode="HTML", reply_markup=keyboard)
         except Exception as e:
             logger.warning("Send fav failed for %s: %s", fav.title, e)
-            await callback.message.answer(caption, parse_mode="HTML", reply_markup=keyboard)
+            sent = await callback.message.answer(caption, parse_mode="HTML", reply_markup=keyboard)
+        sent_ids.append(sent.message_id)
+
+    close_msg = await callback.message.answer(
+        "Натиснiть, щоб закрити список:", reply_markup=close_kb
+    )
+    sent_ids.append(close_msg.message_id)
+    _favorites_messages[user_id] = sent_ids
+
+
+@router.callback_query(lambda c: c.data == "close_favs")
+async def cb_close_favorites(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await _clear_previous_favorites(
+        callback.bot, callback.message.chat.id, callback.from_user.id
+    )
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("unfav:"))
@@ -415,12 +485,44 @@ async def cb_remove_fav(callback: CallbackQuery) -> None:
 # ── Order / Question requests ──────────────────────────────
 
 
+async def _resolve_offer_meta(offer_id: str, user_id: int) -> tuple[str, str]:
+    cached = _offer_cache.get(offer_id)
+    if cached and cached[0]:
+        return cached[0], cached[1]
+
+    if offer_id.startswith("manual_"):
+        try:
+            db_id = int(offer_id.removeprefix("manual_"))
+        except ValueError:
+            db_id = None
+        if db_id is not None:
+            async with async_session() as session:
+                car = (await session.execute(
+                    select(ManualCar).where(ManualCar.id == db_id)
+                )).scalar_one_or_none()
+            if car:
+                return car.url or "", car.title
+
+    async with async_session() as session:
+        fav = (await session.execute(
+            select(Favorite)
+            .where(Favorite.offer_id == offer_id)
+            .order_by((Favorite.user_id == user_id).desc())
+            .limit(1)
+        )).scalar_one_or_none()
+    if fav:
+        return fav.url or "", fav.title
+
+    if cached:
+        return cached[0], cached[1]
+    return "", ""
+
+
 async def _send_request(callback: CallbackQuery, request_type: str) -> None:
     user = callback.from_user
     offer_id = callback.data.split(":", 1)[1]
 
-    cached = _offer_cache.get(offer_id)
-    offer_url, offer_title = (cached[0], cached[1]) if cached else ("", "")
+    offer_url, offer_title = await _resolve_offer_meta(offer_id, user.id)
 
     name = user.full_name or "Невiдомий"
     username_str = f" (@{user.username})" if user.username else ""
