@@ -7,7 +7,27 @@
       "WebFetch(domain:autach.pl)",
       "Bash(source:*)",
       "Bash(head:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(python3 *)",
+      "Bash(curl -sL -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36\" https://autach.pl/ -o /tmp/autach_home.html)",
+      "Read(//tmp/**)",
+      "Bash(curl -sL -o /tmp/old_offers.html -w \"OFFERS_URL_STATUS=%{http_code}\\\\nFINAL_URL=%{url_effective}\\\\n\" -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36\" \"https://autach.pl/offers?from=axa&sortby=ending\")",
+      "Bash(curl -sL -A \"Mozilla/5.0 \\(compatible; Googlebot/2.1; +http://www.google.com/bot.html\\)\" \"https://autach.pl/\" -o /tmp/autach_bot.html)",
+      "Bash(curl -sL -A 'Mozilla/5.0 \\(compatible; Googlebot/2.1; +http://www.google.com/bot.html\\)' -o /tmp/autach_test.html -w '%{http_code}' https://autach.pl__TRACKED_VAR__)",
+      "Bash(curl -sL -A 'Mozilla/5.0 \\(compatible; Googlebot/2.1; +http://www.google.com/bot.html\\)' https://autach.pl/ -o /tmp/home.html)",
+      "Bash(curl -sL -A 'Mozilla/5.0 \\(compatible; Googlebot/2.1; +http://www.google.com/bot.html\\)' https://autach.pl/offer/155472/subaru-impreza-25t-wrx -o /tmp/detail.html)",
+      "Bash(curl -sL -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36' https://autach.pl/ -o /tmp/spa.html)",
+      "Bash(curl -sL -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36' https://autach.pl/__TRACKED_VAR__ -o /tmp/__TRACKED_VAR__ done echo '=== api endpoints ===' grep -hoE '\"/api/[^\"]+\"' '/tmp/main-*.js' '/tmp/chunk-*.js')",
+      "Bash(curl -sL -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36' -w '\\\\nHTTP=%{http_code}\\\\nCT=%{content_type}\\\\n' https://autach.pl/api-v2/auctions -o /tmp/api_auctions.json)",
+      "Bash(curl -sL -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36' -w 'HTTP=%{http_code}\\\\n' https://autach.pl/api-v2/auctions/active -o /tmp/api_active.json)",
+      "Bash(curl -sL -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36' -w 'HTTP=%{http_code}\\\\n' https://autach.pl/api-v2 -o /tmp/api_root.html)",
+      "Bash(curl -sL -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36' -w 'HTTP=%{http_code}\\\\n' 'https://autach.pl/api-v2/auctions?type=all&house=all&sort=ending' -o /tmp/api_all.json)",
+      "Bash(curl -sL -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36' -w 'HTTP=%{http_code}\\\\n' 'https://autach.pl/api-v2/auctions?type=all&house=all&sort=ending&page=1' -o /tmp/api_p1.json)",
+      "Bash(curl -sL -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36' 'https://autach.pl/api-v2/auctions?house=AXA&sort=ending&type=all')",
+      "Bash(curl -sL -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36' 'https://autach.pl/api-v2/auctions?type=all&house=all&sort=ending&__TRACKED_VAR__')",
+      "Bash(curl -sL -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36' 'https://autach.pl/api-v2/auctions?type=all&house=all&sort=ending&pageSize=__TRACKED_VAR__')",
+      "Bash(apt-get list *)",
+      "Bash(sudo apt-get *)"
     ]
   }
 }

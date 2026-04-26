@@ -24,9 +24,16 @@ logger = logging.getLogger(__name__)
 
 MAX_OFFERS = 10
 MAX_PHOTOS = 10
+PAGE_SIZE = 10
 
 # In-memory cache: offer_id -> (url, title, image_url)
 _offer_cache: dict[str, tuple[str, str, str]] = {}
+
+# user_id -> list of message_ids that constitute the current "available cars" page
+_cars_page_messages: dict[int, list[int]] = {}
+
+# user_id -> list of message_ids that constitute the current offer-detail view
+_detail_messages: dict[int, list[int]] = {}
 
 # Relay-chat state: manager_id -> {user_id, user_name, offer_title, request_type, offer_url}
 _active_chat: dict[int, dict] = {}
@@ -86,19 +93,43 @@ async def cmd_id(message: Message) -> None:
 # ── Car listing ────────────────────────────────────────────
 
 
-@router.callback_query(lambda c: c.data == "cars_available")
-async def cb_cars_available(callback: CallbackQuery) -> None:
-    await callback.answer()
+async def _clear_previous_cars_page(bot, chat_id: int, user_id: int) -> None:
+    ids = _cars_page_messages.pop(user_id, [])
+    for mid in ids:
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception as e:
+            logger.debug("delete_message %s failed: %s", mid, e)
+
+
+async def _render_cars_page(callback: CallbackQuery, page: int) -> None:
     msg = callback.message
+    user_id = callback.from_user.id
+    chat_id = msg.chat.id
+    bot = callback.bot
 
     from bot.services.poller import FORTY_EIGHT_HOURS, cached_offers
     offers = [o for o in cached_offers if o.auction_end_seconds < FORTY_EIGHT_HOURS]
 
+    await _clear_previous_cars_page(bot, chat_id, user_id)
+
     if not offers:
-        await msg.answer("Наразi немає авто iз завершенням аукцiону менше нiж за 120 годин.")
+        await msg.answer("Наразi немає авто iз завершенням аукцiону менше нiж за 48 годин.")
         return
 
-    for offer in offers:
+    total = len(offers)
+    total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+    if page < 0:
+        page = 0
+    if page >= total_pages:
+        page = total_pages - 1
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+    page_offers = offers[start:end]
+
+    sent_ids: list[int] = []
+
+    for offer in page_offers:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Переглянути авто", callback_data=f"detail:{offer.id}")],
         ])
@@ -114,15 +145,58 @@ async def cb_cars_available(callback: CallbackQuery) -> None:
             if offer.image_url:
                 is_manual = offer.id.startswith("manual_")
                 if is_manual:
-                    await msg.answer_photo(photo=offer.image_url, caption=caption, parse_mode="HTML", reply_markup=keyboard)
+                    sent = await msg.answer_photo(photo=offer.image_url, caption=caption, parse_mode="HTML", reply_markup=keyboard)
                 else:
                     photo = URLInputFile(offer.image_url)
-                    await msg.answer_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=keyboard)
+                    sent = await msg.answer_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=keyboard)
             else:
-                await msg.answer(caption, parse_mode="HTML", reply_markup=keyboard)
+                sent = await msg.answer(caption, parse_mode="HTML", reply_markup=keyboard)
         except Exception as e:
             logger.warning("Send failed for %s: %s", offer.title, e)
-            await msg.answer(caption, parse_mode="HTML", reply_markup=keyboard)
+            sent = await msg.answer(caption, parse_mode="HTML", reply_markup=keyboard)
+        sent_ids.append(sent.message_id)
+
+    if total_pages > 1:
+        prev_btn = (
+            InlineKeyboardButton(text="◀ Назад", callback_data=f"cars_page:{page - 1}")
+            if page > 0
+            else InlineKeyboardButton(text="·", callback_data="noop")
+        )
+        next_btn = (
+            InlineKeyboardButton(text="Далi ▶", callback_data=f"cars_page:{page + 1}")
+            if page < total_pages - 1
+            else InlineKeyboardButton(text="·", callback_data="noop")
+        )
+        nav_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            prev_btn,
+            InlineKeyboardButton(text=f"Сторiнка {page + 1} з {total_pages}", callback_data="noop"),
+            next_btn,
+        ]])
+        nav_msg = await msg.answer("Виберiть сторiнку:", reply_markup=nav_kb)
+        sent_ids.append(nav_msg.message_id)
+
+    _cars_page_messages[user_id] = sent_ids
+
+
+@router.callback_query(lambda c: c.data == "cars_available")
+async def cb_cars_available(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await _render_cars_page(callback, page=0)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("cars_page:"))
+async def cb_cars_page(callback: CallbackQuery) -> None:
+    await callback.answer()
+    try:
+        page = int(callback.data.removeprefix("cars_page:"))
+    except ValueError:
+        return
+    await _render_cars_page(callback, page=page)
+
+
+@router.callback_query(lambda c: c.data == "noop")
+async def cb_noop(callback: CallbackQuery) -> None:
+    await callback.answer()
 
 
 # ── Car detail ─────────────────────────────────────────────
@@ -202,8 +276,10 @@ async def cb_offer_detail(callback: CallbackQuery) -> None:
         [InlineKeyboardButton(text="Замовити авто", callback_data=f"order:{offer_id}")],
         [InlineKeyboardButton(text="Уточнити деталi", callback_data=f"ask:{offer_id}")],
         [InlineKeyboardButton(text="Додати в обранi", callback_data=f"fav:{offer_id}")],
-        [InlineKeyboardButton(text="Назад до списку", callback_data="cars_available")],
+        [InlineKeyboardButton(text="Назад до списку", callback_data="back_to_list")],
     ])
+
+    detail_ids: list[int] = []
 
     photos = detail.photos[:MAX_PHOTOS]
     if photos:
@@ -215,21 +291,42 @@ async def cb_offer_detail(callback: CallbackQuery) -> None:
             media = [InputMediaPhoto(media=URLInputFile(p)) for p in photos]
             media[0] = InputMediaPhoto(media=URLInputFile(photos[0]), caption=caption, parse_mode="HTML")
         try:
-            await msg.answer_media_group(media=media)
+            media_msgs = await msg.answer_media_group(media=media)
+            detail_ids.extend(m.message_id for m in media_msgs)
         except Exception as e:
             logger.warning("Media group failed: %s", e)
             try:
                 if is_manual:
-                    await msg.answer_photo(photo=photos[0], caption=caption, parse_mode="HTML")
+                    fallback_msg = await msg.answer_photo(photo=photos[0], caption=caption, parse_mode="HTML")
                 else:
-                    await msg.answer_photo(photo=URLInputFile(photos[0]), caption=caption, parse_mode="HTML")
+                    fallback_msg = await msg.answer_photo(photo=URLInputFile(photos[0]), caption=caption, parse_mode="HTML")
+                detail_ids.append(fallback_msg.message_id)
             except Exception:
-                await msg.answer(caption, parse_mode="HTML")
+                fallback_msg = await msg.answer(caption, parse_mode="HTML")
+                detail_ids.append(fallback_msg.message_id)
 
-    await msg.answer(
+    kb_msg = await msg.answer(
         "Якщо вам подобається авто, натиснiть кнопку нижче 👇",
         reply_markup=keyboard,
     )
+    detail_ids.append(kb_msg.message_id)
+    _detail_messages[callback.from_user.id] = detail_ids
+
+
+@router.callback_query(lambda c: c.data == "back_to_list")
+async def cb_back_to_list(callback: CallbackQuery) -> None:
+    await callback.answer()
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    bot = callback.bot
+    ids = _detail_messages.pop(user_id, [])
+    if not ids:
+        ids = [callback.message.message_id]
+    for mid in ids:
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception as e:
+            logger.debug("back_to_list delete %s failed: %s", mid, e)
 
 
 # ── Favorites ──────────────────────────────────────────────

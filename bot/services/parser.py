@@ -8,19 +8,22 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-OFFERS_URLS = [
-    "https://autach.pl/offers?from=axa&sortby=ending",
-    "https://autach.pl/offers?from=rest&sortby=ending",
-    "https://autach.pl/offers?from=allianz&sortby=ending",
-]
+BASE_URL = "https://autach.pl"
+AUCTIONS_API = f"{BASE_URL}/api-v2/auctions"
+PAGE_SIZE = 100
 
+# Detail pages are an Angular SPA; the prerender layer only returns rendered
+# HTML for crawler User-Agents. Without this header we get an empty <app-root>.
+BOT_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+
+# Detail-page spec labels (Googlebot prerender returns English labels).
 SPEC_MAP = {
-    "Treibstoff": "Вид палива",
-    "Hubraum": "Об'єм двигуна",
-    "Getriebe": "Коробка передач",
-    "Antrieb": "Привiд",
-    "Karosserie": "Кузов",
-    "Aussenfarbe": "Колiр",
+    "Fuel": "Вид палива",
+    "Engine capacity": "Об'єм двигуна",
+    "Gearbox type": "Коробка передач",
+    "Drive": "Привiд",
+    "Body Type / Doors": "Кузов",
+    "Color": "Колiр",
 }
 
 
@@ -40,13 +43,12 @@ def format_remaining(seconds: int) -> str:
     return " ".join(parts)
 
 
-def _parse_auction_end(text: str) -> int:
-    """Parse 'YYYY-MM-DD HH:MM:SS' -> seconds remaining until auction end.
+def _parse_iso_end(text: str) -> int:
+    """Parse 'YYYY-MM-DDTHH:MM:SS' (assumed UTC) -> seconds remaining.
     Returns 999999 on failure."""
     try:
-        end_dt = datetime.strptime(text.strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        diff = (end_dt - now).total_seconds()
+        end_dt = datetime.fromisoformat(text).replace(tzinfo=timezone.utc)
+        diff = (end_dt - datetime.now(timezone.utc)).total_seconds()
         return max(0, int(diff))
     except (ValueError, TypeError):
         return 999999
@@ -77,145 +79,138 @@ class OfferDetail:
     specs: dict[str, str] = field(default_factory=dict)
 
 
-def _parse_cards(html: str, source: str) -> list[OfferItem]:
-    soup = BeautifulSoup(html, "lxml")
-    cards = soup.select(".offer-card")
+def _auction_to_offer(a: dict) -> OfferItem | None:
+    aid = a.get("id")
+    end_iso = a.get("offerEnd") or ""
+    if aid is None or not end_iso:
+        return None
 
-    offers: list[OfferItem] = []
-    for card in cards:
-        h3 = card.select_one("h3")
-        if not h3:
-            continue
-        title = h3.get_text(strip=True)
+    folder = a.get("photosFolder") or ""
+    main = a.get("mainPhoto") or ""
+    image_url = f"{BASE_URL}/images/offer/{folder}/{main}" if folder and main else ""
 
-        auction_id_el = card.select_one("p.auction-id")
-        lot_id = ""
-        if auction_id_el:
-            text = auction_id_el.get_text(strip=True)
-            if ":" in text:
-                lot_id = text.split(":")[1].strip().split()[0]
+    link = a.get("offerLink") or ""
+    url = f"{BASE_URL}{link}" if link.startswith("/") else link
 
-        year = ""
-        mileage = ""
-        auction_end = ""
-        labels = card.select(".offer-details p.label")
-        for label_el in labels:
-            label_text = label_el.get_text(strip=True)
-            value_el = label_el.find_next_sibling("p", class_="value")
-            if not value_el:
-                continue
-            value_text = value_el.get_text(strip=True)
+    reg = a.get("firstRegistrationDate") or ""
+    year = reg[:4] if reg else ""
 
-            if "Rejestracja" in label_text:
-                year = value_text
-            elif "Przebieg" in label_text:
-                mileage = value_text.replace(" km", "").replace("\xa0", "").strip()
-            elif label_text == "Data zakończenia":
-                auction_end = value_text
+    mileage_val = a.get("mileage")
+    mileage = str(mileage_val) if mileage_val is not None else ""
 
-        auction_end_seconds = _parse_auction_end(auction_end)
+    return OfferItem(
+        id=str(aid),
+        title=a.get("name") or f'{a.get("brand", "")} {a.get("model", "")}'.strip(),
+        year=year,
+        mileage=mileage,
+        auction_end=end_iso.replace("T", " "),
+        url=url,
+        image_url=image_url,
+        source=a.get("websiteName") or "",
+        auction_end_seconds=_parse_iso_end(end_iso),
+    )
 
-        link_el = card.select_one("a[href*='/offer/']")
-        detail_url = link_el["href"] if link_el else ""
 
-        img_el = card.select_one(".swiper-slide img")
-        image_url = img_el["src"] if img_el and img_el.get("src") else ""
-
-        offers.append(OfferItem(
-            id=lot_id,
-            title=title,
-            year=year,
-            mileage=mileage,
-            auction_end=auction_end,
-            url=detail_url,
-            image_url=image_url,
-            source=source,
-            auction_end_seconds=auction_end_seconds,
-        ))
-
-    return offers
+async def _fetch_page(client: httpx.AsyncClient, page: int) -> dict:
+    resp = await client.get(
+        AUCTIONS_API,
+        params={
+            "type": "all",
+            "house": "all",
+            "sort": "ending",
+            "page": page,
+            "pageSize": PAGE_SIZE,
+        },
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 async def fetch_offers() -> list[OfferItem]:
-    """Fetch from all sources, merge, sort by auction_end_seconds ascending (most urgent first)."""
-    async with httpx.AsyncClient(timeout=15) as client:
-        tasks = [client.get(url) for url in OFFERS_URLS]
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
+    """Fetch all active auctions via /api-v2/auctions, sorted by ending time ascending."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        try:
+            first = await _fetch_page(client, 1)
+        except Exception as e:
+            logger.error("Auctions API page 1 failed: %s", e)
+            return []
 
-    all_offers: list[OfferItem] = []
-    sources = ["AXA", "REST", "Allianz"]
-    for resp, source in zip(responses, sources):
-        if isinstance(resp, Exception):
-            logger.warning("Source %s fetch error: %s", source, resp)
-            continue
-        if resp.status_code != 200:
-            logger.warning("Source %s returned HTTP %s", source, resp.status_code)
-            continue
-        all_offers.extend(_parse_cards(resp.text, source))
+        total = int(first.get("totalCount") or 0)
+        items = list(first.get("auctions") or [])
 
-    # Deduplicate by offer ID
+        if total > PAGE_SIZE:
+            pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+            results = await asyncio.gather(
+                *(_fetch_page(client, p) for p in range(2, pages + 1)),
+                return_exceptions=True,
+            )
+            for p, res in enumerate(results, start=2):
+                if isinstance(res, Exception):
+                    logger.warning("Auctions API page %d failed: %s", p, res)
+                    continue
+                items.extend(res.get("auctions") or [])
+
+    offers: list[OfferItem] = []
     seen: set[str] = set()
-    unique: list[OfferItem] = []
-    for o in all_offers:
-        if o.id and o.id not in seen:
-            seen.add(o.id)
-            unique.append(o)
+    for a in items:
+        offer = _auction_to_offer(a)
+        if offer is None or not offer.id or offer.id in seen:
+            continue
+        seen.add(offer.id)
+        offers.append(offer)
 
-    # Sort by auction_end_seconds ascending (most urgent first)
-    unique.sort(key=lambda o: o.auction_end_seconds)
-    return unique
+    offers.sort(key=lambda o: o.auction_end_seconds)
+    return offers
 
 
 async def fetch_offer_detail(url: str) -> OfferDetail | None:
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=20, headers={"User-Agent": BOT_UA}) as client:
         resp = await client.get(url)
         resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "lxml")
 
-    h2 = soup.select_one("h2")
-    title = h2.get_text(strip=True) if h2 else ""
-
-    year = ""
-    mileage = ""
-    for label_el in soup.select("p.label"):
-        label_text = label_el.get_text(strip=True).lower()
-        value_el = label_el.find_next_sibling("p")
-        if not value_el:
-            continue
-        val = value_el.get_text(strip=True)
-        if "rejestracja" in label_text or "registrierung" in label_text:
-            year = val
-        elif "przebieg" in label_text:
-            mileage = val.replace(" km", "").replace("\xa0", "").strip()
+    title_el = soup.select_one("h1.premium-auction-title-detail") or soup.select_one("h1")
+    title = title_el.get_text(" ", strip=True) if title_el else ""
 
     specs: dict[str, str] = {}
     fuel = ""
     engine = ""
     transmission = ""
-    for row in soup.select(".table-row"):
-        cols = row.select(".table-col")
-        if len(cols) < 2:
+    year = ""
+    mileage = ""
+    for row in soup.select(".premium-spec-row"):
+        label_el = row.select_one(".premium-spec-label")
+        value_el = row.select_one(".premium-spec-value")
+        if not label_el or not value_el:
             continue
-        key = cols[0].get_text(strip=True)
-        val = cols[1].get_text(strip=True)
+        key = label_el.get_text(strip=True)
+        val = value_el.get_text(strip=True)
         if not val:
             continue
 
-        if key == "Treibstoff":
+        if key == "Fuel":
             fuel = val
-        elif key == "Hubraum":
+        elif key == "Engine capacity":
             engine = val
-        elif key == "Getriebe":
+        elif key == "Gearbox type":
             transmission = val
+        elif key == "Mileage (km)":
+            mileage = val.replace("\xa0", "").replace(" ", "")
+        elif key == "First inv.":
+            year = val[-4:] if len(val) >= 4 else val
 
         if key in SPEC_MAP:
             specs[SPEC_MAP[key]] = val
 
-    photos = []
-    for img in soup.select(".image-slider img"):
+    photos: list[str] = []
+    for img in soup.find_all("img"):
         src = img.get("src", "")
-        if src and src not in photos:
+        if "/images/offer/" not in src:
+            continue
+        if "/thumb_" in src or "/thumb-" in src:
+            continue
+        if src not in photos:
             photos.append(src)
 
     return OfferDetail(
