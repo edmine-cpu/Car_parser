@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://autach.pl"
 AUCTIONS_API = f"{BASE_URL}/api-v2/auctions"
 PAGE_SIZE = 100
+ALLOWED_HOUSES = ("AXA", "REST", "Allianz")
 
 # Detail pages are an Angular SPA; the prerender layer only returns rendered
 # HTML for crawler User-Agents. Without this header we get an empty <app-root>.
@@ -111,12 +112,12 @@ def _auction_to_offer(a: dict) -> OfferItem | None:
     )
 
 
-async def _fetch_page(client: httpx.AsyncClient, page: int) -> dict:
+async def _fetch_page(client: httpx.AsyncClient, house: str, page: int) -> dict:
     resp = await client.get(
         AUCTIONS_API,
         params={
             "type": "all",
-            "house": "all",
+            "house": house,
             "sort": "ending",
             "page": page,
             "pageSize": PAGE_SIZE,
@@ -127,34 +128,38 @@ async def _fetch_page(client: httpx.AsyncClient, page: int) -> dict:
 
 
 async def fetch_offers() -> list[OfferItem]:
-    """Fetch all active auctions via /api-v2/auctions, sorted by ending time ascending."""
+    """Fetch active auctions for ALLOWED_HOUSES, sorted by ending time ascending."""
+    items: list[dict] = []
     async with httpx.AsyncClient(timeout=20) as client:
-        try:
-            first = await _fetch_page(client, 1)
-        except Exception as e:
-            logger.error("Auctions API page 1 failed: %s", e)
-            return []
+        for house in ALLOWED_HOUSES:
+            try:
+                first = await _fetch_page(client, house, 1)
+            except Exception as e:
+                logger.error("Auctions API page 1 failed for house %s: %s", house, e)
+                continue
 
-        total = int(first.get("totalCount") or 0)
-        items = list(first.get("auctions") or [])
+            total = int(first.get("totalCount") or 0)
+            items.extend(first.get("auctions") or [])
 
-        if total > PAGE_SIZE:
-            pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
-            results = await asyncio.gather(
-                *(_fetch_page(client, p) for p in range(2, pages + 1)),
-                return_exceptions=True,
-            )
-            for p, res in enumerate(results, start=2):
-                if isinstance(res, Exception):
-                    logger.warning("Auctions API page %d failed: %s", p, res)
-                    continue
-                items.extend(res.get("auctions") or [])
+            if total > PAGE_SIZE:
+                pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+                results = await asyncio.gather(
+                    *(_fetch_page(client, house, p) for p in range(2, pages + 1)),
+                    return_exceptions=True,
+                )
+                for p, res in enumerate(results, start=2):
+                    if isinstance(res, Exception):
+                        logger.warning("Auctions API page %d failed for house %s: %s", p, house, res)
+                        continue
+                    items.extend(res.get("auctions") or [])
 
     offers: list[OfferItem] = []
     seen: set[str] = set()
     for a in items:
         offer = _auction_to_offer(a)
         if offer is None or not offer.id or offer.id in seen:
+            continue
+        if offer.source and offer.source not in ALLOWED_HOUSES:
             continue
         seen.add(offer.id)
         offers.append(offer)
