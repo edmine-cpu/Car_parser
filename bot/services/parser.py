@@ -2,6 +2,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 from bs4 import BeautifulSoup
@@ -10,8 +11,11 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://autach.pl"
 AUCTIONS_API = f"{BASE_URL}/api-v2/auctions"
-PAGE_SIZE = 100
+PAGE_SIZE = 10
 ALLOWED_HOUSES = ("AXA", "REST", "Allianz")
+
+# autach.pl returns offerEnd in local Polish time, not UTC.
+SITE_TZ = ZoneInfo("Europe/Warsaw")
 
 # Detail pages are an Angular SPA; the prerender layer only returns rendered
 # HTML for crawler User-Agents. Without this header we get an empty <app-root>.
@@ -45,10 +49,10 @@ def format_remaining(seconds: int) -> str:
 
 
 def _parse_iso_end(text: str) -> int:
-    """Parse 'YYYY-MM-DDTHH:MM:SS' (assumed UTC) -> seconds remaining.
+    """Parse 'YYYY-MM-DDTHH:MM:SS' (Europe/Warsaw local time) -> seconds remaining.
     Returns 999999 on failure."""
     try:
-        end_dt = datetime.fromisoformat(text).replace(tzinfo=timezone.utc)
+        end_dt = datetime.fromisoformat(text).replace(tzinfo=SITE_TZ)
         diff = (end_dt - datetime.now(timezone.utc)).total_seconds()
         return max(0, int(diff))
     except (ValueError, TypeError):

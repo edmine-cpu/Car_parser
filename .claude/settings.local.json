@@ -27,7 +27,14 @@
       "Bash(curl -sL -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36' 'https://autach.pl/api-v2/auctions?type=all&house=all&sort=ending&__TRACKED_VAR__')",
       "Bash(curl -sL -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36' 'https://autach.pl/api-v2/auctions?type=all&house=all&sort=ending&pageSize=__TRACKED_VAR__')",
       "Bash(apt-get list *)",
-      "Bash(sudo apt-get *)"
+      "Bash(sudo apt-get *)",
+      "Bash(curl -s 'https://autach.pl/api-v2/auctions?type=all&house=AXA&sort=ending&page=1&pageSize=3')",
+      "Bash(curl -sI 'https://autach.pl/api-v2/auctions?type=all&house=AXA&sort=ending&page=1&pageSize=100')",
+      "Bash(curl -s 'https://autach.pl/api-v2/auctions?type=all&sort=ending&page=1&pageSize=20')",
+      "Bash(curl -s 'https://autach.pl/api-v2/auctions?type=all&house=__TRACKED_VAR__&sort=ending&page=1&pageSize=5')",
+      "Bash(curl -s 'https://autach.pl/api-v2/auctions?type=all&house=AXA&sort=ending&page=1&pageSize=100')",
+      "Bash(curl -s 'https://autach.pl/api-v2/auctions?type=all&house=__TRACKED_VAR__&sort=ending&page=1&pageSize=100')",
+      "Bash(curl -s 'https://autach.pl/api-v2/auctions?type=all&house=AXA&sort=ending&page=7&pageSize=100')"
     ]
   }
 }
