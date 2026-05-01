@@ -6,8 +6,9 @@ from datetime import datetime, timezone
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, URLInputFile
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from bot.db import Favorite, ManualCar, async_session
+from bot.db import Favorite, ManualCar, OfferSnapshot, async_session
 from bot.services.parser import OfferItem, fetch_offers, format_remaining
 
 logger = logging.getLogger(__name__)
@@ -155,6 +156,40 @@ async def _fetch_offers_safe() -> list[OfferItem]:
         return await fetch_offers()
 
 
+async def _persist_snapshots(offers: list[OfferItem]) -> None:
+    """Upsert title/url/image for every live offer so that order/question
+    requests can resolve metadata even after a lot closes or the bot restarts."""
+    if not offers:
+        return
+    rows = [
+        {
+            "offer_id": o.id,
+            "title": o.title or "",
+            "url": o.url or "",
+            "image_url": o.image_url or None,
+        }
+        for o in offers
+        if o.id and not o.id.startswith("manual_")
+    ]
+    if not rows:
+        return
+    try:
+        async with async_session() as session:
+            stmt = pg_insert(OfferSnapshot).values(rows)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["offer_id"],
+                set_={
+                    "title": stmt.excluded.title,
+                    "url": stmt.excluded.url,
+                    "image_url": stmt.excluded.image_url,
+                },
+            )
+            await session.execute(stmt)
+            await session.commit()
+    except Exception as e:
+        logger.error("Failed to persist offer snapshots: %s", e)
+
+
 async def poll_new_offers(bot: Bot) -> None:
     """Background task: fetch offers every 3 minutes, send notifications to subscribers."""
     global _seen_ids, cached_offers
@@ -173,6 +208,8 @@ async def poll_new_offers(bot: Bot) -> None:
         from bot.handlers.start import _offer_cache
         for o in cached_offers:
             _offer_cache[o.id] = (o.url, o.title, o.image_url)
+
+        await _persist_snapshots(cached_offers)
 
         # Mark 3h favorites without sending (avoid spam on restart)
         await _check_favorites_3h(bot, notify=False)
@@ -203,6 +240,8 @@ async def poll_new_offers(bot: Bot) -> None:
             for o in offers:
                 _offer_cache[o.id] = (o.url, o.title, o.image_url)
                 _seen_ids.add(o.id)
+
+            await _persist_snapshots(offers)
 
             # Check favorites for 3h notifications
             await _check_favorites_3h(bot, notify=True)

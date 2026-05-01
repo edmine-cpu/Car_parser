@@ -62,6 +62,24 @@ class Request(Base):
         return f"<Request {self.id} {self.request_type} {self.user_name}>"
 
 
+class OfferSnapshot(Base):
+    """Persistent snapshot of every offer ever seen by the poller.
+    Survives restarts and auction closure so order/question requests
+    keep their title and URL even after the lot leaves the live API."""
+    __tablename__ = "offer_snapshots"
+
+    offer_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    title: Mapped[str] = mapped_column(String(512), default="")
+    url: Mapped[str] = mapped_column(String(2048), default="")
+    image_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    def __repr__(self) -> str:
+        return f"<OfferSnapshot {self.offer_id} {self.title!r}>"
+
+
 class ManualCar(Base):
     __tablename__ = "manual_cars"
 

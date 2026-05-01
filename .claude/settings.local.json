@@ -34,7 +34,14 @@
       "Bash(curl -s 'https://autach.pl/api-v2/auctions?type=all&house=__TRACKED_VAR__&sort=ending&page=1&pageSize=5')",
       "Bash(curl -s 'https://autach.pl/api-v2/auctions?type=all&house=AXA&sort=ending&page=1&pageSize=100')",
       "Bash(curl -s 'https://autach.pl/api-v2/auctions?type=all&house=__TRACKED_VAR__&sort=ending&page=1&pageSize=100')",
-      "Bash(curl -s 'https://autach.pl/api-v2/auctions?type=all&house=AXA&sort=ending&page=7&pageSize=100')"
+      "Bash(curl -s 'https://autach.pl/api-v2/auctions?type=all&house=AXA&sort=ending&page=7&pageSize=100')",
+      "Bash(curl -s -I 'https://auta.ch/auctions?page=1&recommended=false&popular=false&recent=false&sortDir=asc&sortBy=endTime&type=all' -A 'Mozilla/5.0 \\(compatible; Googlebot/2.1; +http://www.google.com/bot.html\\)')",
+      "Bash(curl -s -o /tmp/auta_resp.html -w \"%{http_code}\\\\n\" 'https://auta.ch/auctions?page=1&sortDir=asc&sortBy=endTime&type=all' -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/120.0.0.0 Safari/537.36' -H 'Accept: text/html,application/xhtml+xml' -H 'Accept-Language: pl-PL,pl;q=0.9,en;q=0.8')",
+      "Bash(curl -s 'https://auta.ch/api/auctions?page=1&pageSize=10&type=all&sortBy=endTime&sortDir=asc' -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/120.0.0.0 Safari/537.36' -H 'Accept: application/json' -o /tmp/api1.json -w \"%{http_code} %{size_download}\\\\n\")",
+      "Bash(curl -s 'https://auta.ch/api-v2/auctions?page=1&pageSize=10&type=all&sortBy=endTime&sortDir=asc' -A 'Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/120.0.0.0 Safari/537.36' -H 'Accept: application/json' -o /tmp/api2.json -w \"%{http_code} %{size_download}\\\\n\")",
+      "Bash(curl *)",
+      "Bash(grep -oE 'baseUrl[^,;}]{0,80}' /tmp/main.js)",
+      "Bash(grep -oE '`[^`]{3,80}`' /tmp/main.js)"
     ]
   }
 }

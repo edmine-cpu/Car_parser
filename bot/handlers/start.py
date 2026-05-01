@@ -17,7 +17,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from bot.config import settings
-from bot.db import Favorite, ManualCar, Request, async_session
+from bot.db import Favorite, ManualCar, OfferSnapshot, Request, async_session
 from bot.services.parser import OfferDetail, fetch_offer_detail, format_remaining
 
 router = Router()
@@ -515,6 +515,13 @@ async def _resolve_offer_meta(offer_id: str, user_id: int) -> tuple[str, str]:
                 )).scalar_one_or_none()
             if car:
                 return car.url or "", car.title
+
+    async with async_session() as session:
+        snap = (await session.execute(
+            select(OfferSnapshot).where(OfferSnapshot.offer_id == offer_id)
+        )).scalar_one_or_none()
+    if snap and (snap.url or snap.title):
+        return snap.url or "", snap.title or ""
 
     async with async_session() as session:
         fav = (await session.execute(
