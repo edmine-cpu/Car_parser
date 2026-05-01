@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -52,7 +52,7 @@ def _parse_iso_end(text: str) -> int:
     """Parse 'YYYY-MM-DDTHH:MM:SS' (Europe/Warsaw local time) -> seconds remaining.
     Returns 999999 on failure."""
     try:
-        end_dt = datetime.fromisoformat(text).replace(tzinfo=SITE_TZ)
+        end_dt = datetime.fromisoformat(text).replace(tzinfo=SITE_TZ) + timedelta(hours=2)
         diff = (end_dt - datetime.now(timezone.utc)).total_seconds()
         return max(0, int(diff))
     except (ValueError, TypeError):
