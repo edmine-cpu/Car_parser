@@ -7,6 +7,7 @@ from bot.config import settings
 from bot.db import Base, engine
 from bot.handlers.add_car import router as add_car_router
 from bot.handlers.start import router as start_router
+from bot.services.notifier import notify_new_cars_loop
 from bot.services.poller import poll_new_offers
 
 logging.basicConfig(level=logging.INFO)
@@ -24,6 +25,7 @@ async def main() -> None:
 
     # Start background poller
     asyncio.create_task(poll_new_offers(bot))
+    asyncio.create_task(notify_new_cars_loop(bot))
 
     logger.info("Starting bot…")
     await dp.start_polling(bot)

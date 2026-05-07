@@ -13,6 +13,7 @@ BASE_URL = "https://autach.pl"
 AUCTIONS_API = f"{BASE_URL}/api-v2/auctions"
 PAGE_SIZE = 10
 ALLOWED_HOUSES = ("AXA", "REST", "Allianz")
+ALLOWED_HOUSES_UPPER = {h.upper() for h in ALLOWED_HOUSES}
 
 # autach.pl returns offerEnd in local Polish time, not UTC.
 SITE_TZ = ZoneInfo("Europe/Warsaw")
@@ -163,7 +164,7 @@ async def fetch_offers() -> list[OfferItem]:
         offer = _auction_to_offer(a)
         if offer is None or not offer.id or offer.id in seen:
             continue
-        if offer.source and offer.source not in ALLOWED_HOUSES:
+        if offer.source and offer.source.upper() not in ALLOWED_HOUSES_UPPER:
             continue
         seen.add(offer.id)
         offers.append(offer)
