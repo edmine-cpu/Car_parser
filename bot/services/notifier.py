@@ -1,7 +1,7 @@
-"""Scheduled manager notifications.
+"""Scheduled subscriber notifications.
 
-Wakes at 09/12/15/18/21 Europe/Kyiv each day and reports the count of new
-offers seen since the previous slot. Relies on OfferSnapshot.updated_at
+Wakes at 21:00 Europe/Kyiv each day and reports the count of new offers
+seen since the previous slot (24h window). Relies on OfferSnapshot.updated_at
 behaving as 'first-seen-at': the poller's on_conflict_do_update does not
 touch updated_at, and SQLAlchemy's onupdate hook is bypassed by the
 dialect-specific on_conflict_do_update path."""
@@ -13,13 +13,12 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot
 from sqlalchemy import func, select
 
-from bot.config import settings
 from bot.db import OfferSnapshot, async_session
 
 logger = logging.getLogger(__name__)
 
 KYIV = ZoneInfo("Europe/Kyiv")
-SLOT_HOURS = (9, 12, 15, 18, 21)
+SLOT_HOURS = (21,)
 
 
 def _next_slot(now: datetime) -> datetime:
@@ -53,12 +52,15 @@ async def _count_new_offers(start: datetime, end: datetime) -> int:
         return int(result.scalar() or 0)
 
 
-async def _broadcast(bot: Bot, text: str) -> None:
-    for mgr_id in settings.manager_ids:
+async def _broadcast(bot: Bot, text: str) -> list[int]:
+    from bot.services.poller import subscribers
+    recipients = list(subscribers)
+    for user_id in recipients:
         try:
-            await bot.send_message(mgr_id, text)
+            await bot.send_message(user_id, text)
         except Exception as e:
-            logger.warning("Manager notify failed for %s: %s", mgr_id, e)
+            logger.warning("User notify failed for %s: %s", user_id, e)
+    return recipients
 
 
 async def notify_new_cars_loop(bot: Bot) -> None:
@@ -78,5 +80,5 @@ async def notify_new_cars_loop(bot: Bot) -> None:
             continue
 
         text = f"За останні {hours} часов було додано {count} авто."
-        await _broadcast(bot, text)
-        logger.info("Notified %d managers: %s", len(settings.manager_ids), text)
+        recipients = await _broadcast(bot, text)
+        logger.info("Notified %d subscribers: %s", len(recipients), text)
