@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot
 from sqlalchemy import func, select
 
-from bot.db import OfferSnapshot, async_session
+from bot.db import OfferSnapshot, User, async_session
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,14 @@ async def _count_new_offers(start: datetime, end: datetime) -> int:
 
 async def _broadcast(bot: Bot, text: str) -> list[int]:
     from bot.services.poller import subscribers
-    recipients = list(subscribers)
+    chat_ids: set[int] = set(subscribers)
+    try:
+        async with async_session() as session:
+            result = await session.execute(select(User.chat_id))
+            chat_ids.update(int(x) for x in result.scalars().all())
+    except Exception as e:
+        logger.error("Failed to load users for broadcast, falling back to in-memory subscribers: %s", e)
+    recipients = list(chat_ids)
     for user_id in recipients:
         try:
             await bot.send_message(user_id, text)

@@ -80,6 +80,21 @@ class OfferSnapshot(Base):
         return f"<OfferSnapshot {self.offer_id} {self.title!r}>"
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    first_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    def __repr__(self) -> str:
+        return f"<User {self.chat_id}>"
+
+
 class ManualCar(Base):
     __tablename__ = "manual_cars"
 

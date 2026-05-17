@@ -13,11 +13,11 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     URLInputFile,
 )
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from bot.config import settings
-from bot.db import Favorite, ManualCar, OfferSnapshot, Request, async_session
+from bot.db import Favorite, ManualCar, OfferSnapshot, Request, User, async_session
 from bot.services.parser import OfferDetail, fetch_offer_detail, format_remaining
 
 router = Router()
@@ -93,6 +93,17 @@ def start_keyboard(user_id: int, last_page: int | None = None) -> InlineKeyboard
 async def cmd_start(message: Message) -> None:
     from bot.services.poller import subscribers
     subscribers.add(message.chat.id)
+    try:
+        async with async_session() as session:
+            stmt = pg_insert(User).values(chat_id=message.chat.id)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["chat_id"],
+                set_={"last_seen": func.now()},
+            )
+            await session.execute(stmt)
+            await session.commit()
+    except Exception as e:
+        logger.warning("Failed to upsert user %s: %s", message.chat.id, e)
     await message.answer("Оберiть дiю:", reply_markup=start_keyboard(message.from_user.id))
     if _is_manager(message.from_user.id):
         await message.answer("Панель менеджера:", reply_markup=_mgr_keyboard)
